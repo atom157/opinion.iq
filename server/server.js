@@ -1,5 +1,4 @@
 import express from "express";
-import fetch from "node-fetch";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,8 +37,6 @@ async function fetchMarketDetail(marketId) {
   for (const ep of endpoints) {
     try {
       const r = await openApiGet(ep);
-
-      // 🔑 ГОЛОВНЕ ВИПРАВЛЕННЯ
       if (isObj(r?.data)) return r.data;
       if (isObj(r?.result)) return r.result;
       if (isObj(r)) return r;
@@ -52,7 +49,7 @@ async function fetchMarketDetail(marketId) {
 /* ================= routes ================= */
 
 app.get("/", (_, res) => {
-  res.json({ ok: true, service: "opinioniq", status: "online" });
+  res.json({ ok: true, status: "online" });
 });
 
 app.get("/api/debug", async (req, res) => {
@@ -65,41 +62,9 @@ app.get("/api/debug", async (req, res) => {
     res.json({
       ok: true,
       marketId,
-      marketKeys: Object.keys(market),
       yesTokenId: market.yesTokenId || null,
       noTokenId: market.noTokenId || null,
-      market,
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.get("/api/analyze", async (req, res) => {
-  try {
-    const { marketId } = req.query;
-    if (!marketId) return res.status(400).json({ ok: false, error: "marketId required" });
-
-    const market = await fetchMarketDetail(marketId);
-
-    if (!market.yesTokenId || !market.noTokenId) {
-      return res.json({
-        ok: false,
-        reason: "NO_TOKENS",
-        hint: "use child marketId",
-        marketId,
-      });
-    }
-
-    res.json({
-      ok: true,
-      marketId,
-      title: market.marketTitle,
-      yesTokenId: market.yesTokenId,
-      noTokenId: market.noTokenId,
-      volume: market.volume,
-      chainId: market.chainId,
-      quoteToken: market.quoteToken,
+      keys: Object.keys(market),
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -108,6 +73,6 @@ app.get("/api/analyze", async (req, res) => {
 
 /* ================= start ================= */
 
-app.listen(PORT, () => {
-  console.log(`🚀 opinioniq running on :${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on ${PORT}`);
 });
