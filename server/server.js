@@ -51,8 +51,9 @@ function isObj(x) {
  * - { code, msg, result }
  * - { errno, errmsg, result }
  */
-async function openApiGet(pathnameAndQuery, { allowNoEnvelope = true } = {}) {
+async function openApiGet(pathnameAndQuery) {
   const url = join(OPINION_API_BASE, pathnameAndQuery);
+
   const resp = await fetch(url, { headers: headers() });
   const text = await resp.text();
 
@@ -70,149 +71,50 @@ async function openApiGet(pathnameAndQuery, { allowNoEnvelope = true } = {}) {
   }
 
   if (isObj(payload) && "result" in payload && "code" in payload) {
-    if (Number(payload.code) !== 0) {
-      console.error(`OpenAPI code!=0 for ${url}: ${JSON.stringify(payload)}`);
-      throw new Error(payload.msg || "OpenAPI error");
-    }
+    if (Number(payload.code) !== 0) throw new Error(payload.msg || "OpenAPI error");
     return payload.result;
   }
 
   if (isObj(payload) && "result" in payload && "errno" in payload) {
-    if (Number(payload.errno) !== 0) {
-      console.error(`OpenAPI errno!=0 for ${url}: ${JSON.stringify(payload)}`);
-      throw new Error(payload.errmsg || "OpenAPI error");
-    }
+    if (Number(payload.errno) !== 0) throw new Error(payload.errmsg || "OpenAPI error");
     return payload.result;
   }
 
-  if (!allowNoEnvelope) {
-    console.error(`Expected envelope, got: ${text}`);
-    throw new Error("Unexpected API response (missing envelope).");
-  }
-
+  // If API returns raw result (rare) — allow it
   return payload;
 }
 
-/* ---------------- OpenAPI path discovery (NO GUESSING) ---------------- */
-
-let _specCache = null;
-let _specFetchedAt = 0;
-
-async function getOpenApiSpec() {
-  const now = Date.now();
-  if (_specCache && now - _specFetchedAt < 5 * 60 * 1000) return _specCache;
-
-  if (!OPINION_API_KEY) {
-    throw new Error("Missing OPINION_API_KEY (needed to fetch OpenAPI spec).");
-  }
-
-  // OPINION_API_BASE already points to .../openapi
-  const url = OPINION_API_BASE;
-
-  // IMPORTANT FIX: include apikey for spec too (401 otherwise)
-  const resp = await fetch(url, {
-    headers: {
-      accept: "application/json",
-      apikey: OPINION_API_KEY,
-    },
-  });
-
-  const text = await resp.text();
-
-  if (!resp.ok) {
-    console.error(`OpenAPI spec fetch failed ${resp.status} for ${url}: ${text}`);
-    throw new Error(`OpenAPI spec fetch failed (${resp.status})`);
-  }
-
-  let spec;
-  try {
-    spec = JSON.parse(text);
-  } catch {
-    console.error(`OpenAPI spec non-json for ${url}: ${text}`);
-    throw new Error("OpenAPI spec is not JSON");
-  }
-
-  if (!isObj(spec) || !isObj(spec.paths)) {
-    console.error(
-      `OpenAPI spec missing paths. keys=${isObj(spec) ? Object.keys(spec) : null}`
-    );
-    throw new Error("OpenAPI spec missing paths");
-  }
-
-  _specCache = spec;
-  _specFetchedAt = now;
-  return spec;
-}
-
-function pickGetPaths(spec) {
-  const paths = spec.paths || {};
-  const out = [];
-  for (const [p, def] of Object.entries(paths)) {
-    if (isObj(def) && def.get) out.push(p);
-  }
-  return out;
-}
-
-function scorePath(p, mustHave = [], niceToHave = []) {
-  const s = p.toLowerCase();
-  let score = 0;
-  for (const w of mustHave) if (s.includes(w)) score += 10;
-  for (const w of niceToHave) if (s.includes(w)) score += 2;
-  if (s.includes("token")) score += 3;
-  if (s.includes("latest")) score += 1;
-  return score;
-}
-
-async function resolveTokenPaths() {
-  const spec = await getOpenApiSpec();
-  const getPaths = pickGetPaths(spec);
-
-  const latestCandidates = getPaths
-    .map((p) => ({ p, score: scorePath(p, ["price"], ["latest", "token"]) }))
-    .filter((x) => x.score >= 10);
-
-  const orderbookCandidates = getPaths
-    .map((p) => ({ p, score: scorePath(p, ["orderbook"], ["token"]) }))
-    .filter((x) => x.score >= 10);
-
-  const historyCandidates = getPaths
-    .map((p) => ({ p, score: scorePath(p, ["history"], ["price", "token"]) }))
-    .filter((x) => x.score >= 10);
-
-  const pickBest = (arr) => arr.sort((a, b) => b.score - a.score)[0]?.p || null;
-
-  return {
-    latestPath: pickBest(latestCandidates),
-    orderbookPath: pickBest(orderbookCandidates),
-    historyPath: pickBest(historyCandidates),
-    allGetPaths: getPaths,
-    candidates: {
-      latest: latestCandidates.slice(0, 20).map((x) => x.p),
-      orderbook: orderbookCandidates.slice(0, 20).map((x) => x.p),
-      history: historyCandidates.slice(0, 20).map((x) => x.p),
-    },
-  };
-}
-
-/* ---------------- market helpers (KNOWN WORKING: /market) ---------------- */
+/* ---------------- market helpers ---------------- */
 
 function pickTopicId(m) {
   return m?.topicId ?? m?.topic_id ?? m?.topicID ?? null;
-}
-
-function pickTokenIds(m) {
-  const yesTokenId =
-    m?.yesTokenId ?? m?.yes_token_id ?? m?.rules?.yesTokenId ?? m?.rules?.yesTokenID ?? null;
-  const noTokenId =
-    m?.noTokenId ?? m?.no_token_id ?? m?.rules?.noTokenId ?? m?.rules?.noTokenID ?? null;
-  return { yesTokenId, noTokenId };
 }
 
 function pickMarketId(m) {
   return m?.marketId ?? m?.market_id ?? m?.id ?? null;
 }
 
+function pickTokenIds(m) {
+  // from your debug sample, tokens are inside rules
+  const yesTokenId =
+    m?.yesTokenId ??
+    m?.yes_token_id ??
+    m?.rules?.yesTokenId ??
+    m?.rules?.yesTokenID ??
+    null;
+
+  const noTokenId =
+    m?.noTokenId ??
+    m?.no_token_id ??
+    m?.rules?.noTokenId ??
+    m?.rules?.noTokenID ??
+    null;
+
+  return { yesTokenId, noTokenId };
+}
+
 async function getMarketListPage(page, limit) {
+  // proven working in your /api/debug: result has { total, list }
   const r = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=2`);
   if (!isObj(r) || !Array.isArray(r.list)) {
     const keys = isObj(r) ? Object.keys(r) : null;
@@ -263,10 +165,28 @@ async function fetchMarketDetailById(marketId) {
   throw lastErr || new Error("Failed to fetch market detail");
 }
 
-/* ---------------- metrics ---------------- */
+/* ---------------- token + metrics ---------------- */
+
+function extractHistoryPoints(history) {
+  if (Array.isArray(history)) return history;
+  if (isObj(history)) {
+    const cands = [
+      history.data,
+      history.list,
+      history.items,
+      history.records,
+      history.rows,
+      history.history,
+      history.prices,
+    ];
+    for (const c of cands) if (Array.isArray(c)) return c;
+  }
+  return [];
+}
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
   if (!orderbook || !mid) return 0;
+
   const threshold = mid * (percent / 100);
   const maxPrice = mid + threshold;
   const minPrice = mid - threshold;
@@ -307,23 +227,6 @@ function formatNumber(value) {
   return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-function extractHistoryPoints(history) {
-  if (Array.isArray(history)) return history;
-  if (isObj(history)) {
-    const cands = [
-      history.data,
-      history.list,
-      history.items,
-      history.records,
-      history.rows,
-      history.history,
-      history.prices,
-    ];
-    for (const c of cands) if (Array.isArray(c)) return c;
-  }
-  return [];
-}
-
 function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   const bestBid = Number(orderbook?.bids?.[0]?.price || 0);
   const bestAsk = Number(orderbook?.asks?.[0]?.price || 0);
@@ -351,6 +254,19 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   return { bestBid, bestAsk, mid, spreadPercent, depth, movePercent, volume24h };
 }
 
+async function fetchTokenBundle(tokenId) {
+  const q = encodeURIComponent(String(tokenId));
+
+  // these are the token endpoints under openapi.opinion.trade/openapi
+  const [latestPrice, orderbook, history] = await Promise.all([
+    openApiGet(`/token/latest-price?token_id=${q}`),
+    openApiGet(`/token/orderbook?token_id=${q}`),
+    openApiGet(`/token/price-history?token_id=${q}&interval=1h`),
+  ]);
+
+  return { latestPrice, orderbook, history };
+}
+
 /* ---------------- endpoints ---------------- */
 
 app.get("/api/health", (req, res) => {
@@ -360,21 +276,30 @@ app.get("/api/health", (req, res) => {
 app.get("/api/debug", async (req, res) => {
   try {
     const r = await getMarketListPage(1, 1);
-    const paths = await resolveTokenPaths();
+    const sample = r.list?.[0] ?? null;
+
+    // quick token endpoint smoke test (if possible)
+    let tokenSmoke = null;
+    try {
+      const { yesTokenId, noTokenId } = pickTokenIds(sample || {});
+      const testToken = yesTokenId || noTokenId;
+      if (testToken) {
+        const latest = await openApiGet(`/token/latest-price?token_id=${encodeURIComponent(String(testToken))}`);
+        tokenSmoke = { ok: true, testTokenId: String(testToken), latestKeys: isObj(latest) ? Object.keys(latest).slice(0, 30) : null };
+      } else {
+        tokenSmoke = { ok: false, reason: "No tokenId found in sample market" };
+      }
+    } catch (e) {
+      tokenSmoke = { ok: false, error: e.message };
+    }
+
     res.json({
       ok: true,
       base: OPINION_API_BASE,
       total: r.total ?? null,
-      sampleKeys: r.list?.[0] ? Object.keys(r.list[0]).slice(0, 60) : null,
-      sample: r.list?.[0] ?? null,
-      tokenPaths: {
-        latest: paths.latestPath,
-        orderbook: paths.orderbookPath,
-        history: paths.historyPath,
-      },
-      // show first 80 GET paths so you can see reality fast
-      firstGetPaths: paths.allGetPaths.slice(0, 80),
-      tokenPathCandidates: paths.candidates,
+      sampleKeys: sample ? Object.keys(sample).slice(0, 80) : null,
+      sample,
+      tokenSmoke,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -406,24 +331,18 @@ app.post("/api/analyze", async (req, res) => {
     if (!yesTokenId || !noTokenId) {
       return res.status(500).json({
         error: "Could not resolve yes/no token IDs for this market.",
-        marketKeys: isObj(market) ? Object.keys(market).slice(0, 120) : null,
+        marketKeys: isObj(market) ? Object.keys(market).slice(0, 140) : null,
       });
     }
 
-    const paths = await resolveTokenPaths();
-    if (!paths.latestPath || !paths.orderbookPath || !paths.historyPath) {
-      return res.status(500).json({
-        error: "Could not auto-resolve token endpoints from OpenAPI spec.",
-        found: {
-          latestPath: paths.latestPath,
-          orderbookPath: paths.orderbookPath,
-          historyPath: paths.historyPath,
-        },
-        candidates: paths.candidates,
-      });
-    }
-
-    const volume24h = Number(market.volume24h ?? market.volume_24h ?? market.volume ?? 0);
+    const volume24h = Number(
+      market?.volume24h ??
+        market?.volume_24h ??
+        market?.volume ??
+        market?.volume7d ??
+        market?.volume7d7 ??
+        0
+    );
 
     const tokenRequests = [
       { side: "YES", tokenId: yesTokenId },
@@ -432,17 +351,7 @@ app.post("/api/analyze", async (req, res) => {
 
     const tokens = await Promise.all(
       tokenRequests.map(async ({ side, tokenId }) => {
-        const q = encodeURIComponent(String(tokenId));
-
-        const latestUrl = `${paths.latestPath}?token_id=${q}`;
-        const orderbookUrl = `${paths.orderbookPath}?token_id=${q}`;
-        const historyUrl = `${paths.historyPath}?token_id=${q}&interval=1h`;
-
-        const [latestPrice, orderbook, history] = await Promise.all([
-          openApiGet(latestUrl),
-          openApiGet(orderbookUrl),
-          openApiGet(historyUrl),
-        ]);
+        const { latestPrice, orderbook, history } = await fetchTokenBundle(tokenId);
 
         const metrics = calcMetrics({ latestPrice, orderbook, history, volume24h });
 
@@ -478,12 +387,16 @@ app.post("/api/analyze", async (req, res) => {
 
         return {
           side,
-          tokenLabel: side,
+          tokenLabel: side, // keep frontend compatibility
           tokenId,
           verdict,
           confidence,
           totalScore,
-          metrics: { spread: metrics.spreadPercent, depth: metrics.depth, move1h: metrics.movePercent },
+          metrics: {
+            spread: metrics.spreadPercent,
+            depth: metrics.depth,
+            move1h: metrics.movePercent,
+          },
           facts,
           why: why.slice(0, 3),
         };
