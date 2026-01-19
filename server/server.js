@@ -17,16 +17,14 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 
 /* ---------------- utils ---------------- */
 
-function parseTopicId(input) {
-  if (!input) return null;
-  try {
-    const u = new URL(input);
-    const id = u.searchParams.get("topicId");
-    return id && /^\d+$/.test(id) ? id : null;
-  } catch {
-    const m = String(input).match(/topicId=(\d+)/);
-    return m ? m[1] : null;
-  }
+function isObj(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
+}
+
+function join(base, p) {
+  const b = base.replace(/\/+$/, "");
+  const pp = String(p || "").startsWith("/") ? p : `/${p}`;
+  return `${b}${pp}`;
 }
 
 function headers() {
@@ -36,14 +34,33 @@ function headers() {
   };
 }
 
-function join(base, p) {
-  const b = base.replace(/\/+$/, "");
-  const pp = String(p || "").startsWith("/") ? p : `/${p}`;
-  return `${b}${pp}`;
-}
+function parseUrlParams(input) {
+  const out = { topicId: null, marketId: null, childMarketId: null };
+  if (!input) return out;
 
-function isObj(x) {
-  return x && typeof x === "object" && !Array.isArray(x);
+  try {
+    const u = new URL(input);
+    const topicId = u.searchParams.get("topicId");
+    const marketId = u.searchParams.get("marketId") || u.searchParams.get("mid");
+    const childMarketId =
+      u.searchParams.get("childMarketId") ||
+      u.searchParams.get("childId") ||
+      u.searchParams.get("subMarketId");
+
+    out.topicId = topicId && /^\d+$/.test(topicId) ? topicId : null;
+    out.marketId = marketId && /^\d+$/.test(marketId) ? marketId : null;
+    out.childMarketId = childMarketId && /^\d+$/.test(childMarketId) ? childMarketId : null;
+    return out;
+  } catch {
+    // fallback regex
+    const t = String(input).match(/topicId=(\d+)/);
+    const m = String(input).match(/marketId=(\d+)/);
+    const c = String(input).match(/childMarketId=(\d+)/);
+    out.topicId = t ? t[1] : null;
+    out.marketId = m ? m[1] : null;
+    out.childMarketId = c ? c[1] : null;
+    return out;
+  }
 }
 
 /**
@@ -80,7 +97,6 @@ async function openApiGet(pathnameAndQuery) {
     return payload.result;
   }
 
-  // If API returns raw result (rare) — allow it
   return payload;
 }
 
@@ -90,12 +106,7 @@ function pickTopicId(m) {
   return m?.topicId ?? m?.topic_id ?? m?.topicID ?? null;
 }
 
-function pickMarketId(m) {
-  return m?.marketId ?? m?.market_id ?? m?.id ?? null;
-}
-
 function pickTokenIds(m) {
-  // from your debug sample, tokens are inside rules
   const yesTokenId =
     m?.yesTokenId ??
     m?.yes_token_id ??
@@ -113,8 +124,12 @@ function pickTokenIds(m) {
   return { yesTokenId, noTokenId };
 }
 
+function hasTokens(m) {
+  const { yesTokenId, noTokenId } = pickTokenIds(m);
+  return Boolean(yesTokenId && noTokenId);
+}
+
 async function getMarketListPage(page, limit) {
-  // proven working in your /api/debug: result has { total, list }
   const r = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=2`);
   if (!isObj(r) || !Array.isArray(r.list)) {
     const keys = isObj(r) ? Object.keys(r) : null;
@@ -137,7 +152,7 @@ async function findMarketByTopicId(topicId) {
   let found = findIn(first.list);
   if (found) return found;
 
-  const maxPages = Math.min(pages, 80);
+  const maxPages = Math.min(pages, 120);
   for (page = 2; page <= maxPages; page++) {
     const r = await getMarketListPage(page, limit);
     found = findIn(r.list);
@@ -146,23 +161,38 @@ async function findMarketByTopicId(topicId) {
   return null;
 }
 
-async function fetchMarketDetailById(marketId) {
-  const id = encodeURIComponent(String(marketId));
-  const candidates = [
-    `/market/${id}`,
-    `/market/detail?market_id=${id}`,
-    `/market/detail?id=${id}`,
-  ];
+/**
+ * Picks the "target market object" that actually contains YES/NO tokenIds.
+ * - If parent has tokens -> use parent
+ * - Else use childMarkets:
+ *   - if URL had marketId/childMarketId -> pick that child
+ *   - else pick first child that has tokens
+ */
+function pickTargetMarket(parentMarket, { marketId, childMarketId }) {
+  if (!parentMarket) return { target: null, pickedFrom: "none" };
 
-  let lastErr = null;
-  for (const c of candidates) {
-    try {
-      return await openApiGet(c);
-    } catch (e) {
-      lastErr = e;
-    }
+  if (hasTokens(parentMarket)) {
+    return { target: parentMarket, pickedFrom: "parent" };
   }
-  throw lastErr || new Error("Failed to fetch market detail");
+
+  const children = Array.isArray(parentMarket.childMarkets)
+    ? parentMarket.childMarkets
+    : [];
+
+  if (!children.length) {
+    return { target: null, pickedFrom: "no-children" };
+  }
+
+  const wantedId = childMarketId || marketId;
+  if (wantedId) {
+    const exact = children.find((c) => String(c.marketId) === String(wantedId));
+    if (exact && hasTokens(exact)) return { target: exact, pickedFrom: "child:exact" };
+  }
+
+  const firstWithTokens = children.find((c) => hasTokens(c));
+  if (firstWithTokens) return { target: firstWithTokens, pickedFrom: "child:firstWithTokens" };
+
+  return { target: null, pickedFrom: "child:noneHaveTokens" };
 }
 
 /* ---------------- token + metrics ---------------- */
@@ -256,14 +286,11 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
 
 async function fetchTokenBundle(tokenId) {
   const q = encodeURIComponent(String(tokenId));
-
-  // these are the token endpoints under openapi.opinion.trade/openapi
   const [latestPrice, orderbook, history] = await Promise.all([
     openApiGet(`/token/latest-price?token_id=${q}`),
     openApiGet(`/token/orderbook?token_id=${q}`),
     openApiGet(`/token/price-history?token_id=${q}&interval=1h`),
   ]);
-
   return { latestPrice, orderbook, history };
 }
 
@@ -278,28 +305,14 @@ app.get("/api/debug", async (req, res) => {
     const r = await getMarketListPage(1, 1);
     const sample = r.list?.[0] ?? null;
 
-    // quick token endpoint smoke test (if possible)
-    let tokenSmoke = null;
-    try {
-      const { yesTokenId, noTokenId } = pickTokenIds(sample || {});
-      const testToken = yesTokenId || noTokenId;
-      if (testToken) {
-        const latest = await openApiGet(`/token/latest-price?token_id=${encodeURIComponent(String(testToken))}`);
-        tokenSmoke = { ok: true, testTokenId: String(testToken), latestKeys: isObj(latest) ? Object.keys(latest).slice(0, 30) : null };
-      } else {
-        tokenSmoke = { ok: false, reason: "No tokenId found in sample market" };
-      }
-    } catch (e) {
-      tokenSmoke = { ok: false, error: e.message };
-    }
-
     res.json({
       ok: true,
       base: OPINION_API_BASE,
       total: r.total ?? null,
       sampleKeys: sample ? Object.keys(sample).slice(0, 80) : null,
       sample,
-      tokenSmoke,
+      note:
+        "If sample has empty yesTokenId/noTokenId, tokens are likely inside sample.childMarkets[].",
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -308,39 +321,34 @@ app.get("/api/debug", async (req, res) => {
 
 app.post("/api/analyze", async (req, res) => {
   const { url } = req.body || {};
-  const topicId = parseTopicId(url);
+  const params = parseUrlParams(url);
+  const topicId = params.topicId;
 
   if (!topicId) return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
   if (!OPINION_API_KEY) return res.status(500).json({ error: "Missing API key (OPINION_API_KEY)." });
 
   try {
-    let market = await findMarketByTopicId(topicId);
-    if (!market) return res.status(404).json({ error: "Market not found for topicId." });
+    const parent = await findMarketByTopicId(topicId);
+    if (!parent) return res.status(404).json({ error: "Market not found for topicId." });
 
-    let { yesTokenId, noTokenId } = pickTokenIds(market);
-
-    if (!yesTokenId || !noTokenId) {
-      const marketId = pickMarketId(market);
-      if (marketId) {
-        const detail = await fetchMarketDetailById(marketId);
-        if (isObj(detail)) market = { ...market, ...detail };
-        ({ yesTokenId, noTokenId } = pickTokenIds(market));
-      }
-    }
-
-    if (!yesTokenId || !noTokenId) {
+    const { target, pickedFrom } = pickTargetMarket(parent, params);
+    if (!target) {
       return res.status(500).json({
-        error: "Could not resolve yes/no token IDs for this market.",
-        marketKeys: isObj(market) ? Object.keys(market).slice(0, 140) : null,
+        error:
+          "Found topic market, but could not resolve a YES/NO token pair (parent + childMarkets).",
+        pickedFrom,
+        parentHasChildren: Array.isArray(parent.childMarkets) ? parent.childMarkets.length : 0,
       });
     }
 
+    const { yesTokenId, noTokenId } = pickTokenIds(target);
+
     const volume24h = Number(
-      market?.volume24h ??
-        market?.volume_24h ??
-        market?.volume ??
-        market?.volume7d ??
-        market?.volume7d7 ??
+      target?.volume24h ??
+        target?.volume_24h ??
+        parent?.volume24h ??
+        parent?.volume_24h ??
+        parent?.volume ??
         0
     );
 
@@ -352,7 +360,6 @@ app.post("/api/analyze", async (req, res) => {
     const tokens = await Promise.all(
       tokenRequests.map(async ({ side, tokenId }) => {
         const { latestPrice, orderbook, history } = await fetchTokenBundle(tokenId);
-
         const metrics = calcMetrics({ latestPrice, orderbook, history, volume24h });
 
         const liquidityScore = scoreMetric(metrics.depth, { ok: 25000, wait: 10000 });
@@ -387,7 +394,7 @@ app.post("/api/analyze", async (req, res) => {
 
         return {
           side,
-          tokenLabel: side, // keep frontend compatibility
+          tokenLabel: side,
           tokenId,
           verdict,
           confidence,
@@ -409,7 +416,12 @@ app.post("/api/analyze", async (req, res) => {
 
     res.json({
       topicId,
-      market,
+      market: {
+        // send both for debugging/frontend
+        parent,
+        pickedFrom,
+        selected: target,
+      },
       overall: { verdict: overallVerdict, confidence: overallConfidence },
       tokens,
     });
