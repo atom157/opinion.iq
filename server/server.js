@@ -12,13 +12,8 @@ const OPINION_API_BASE = String(
 
 const OPINION_API_KEY = String(process.env.OPINION_API_KEY || "").trim();
 
-if (!OPINION_API_BASE) console.warn("Missing OPINION_API_BASE.");
-if (!OPINION_API_KEY) console.warn("Missing OPINION_API_KEY.");
-
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
-
-/* ---------------- helpers ---------------- */
 
 function parseTopicId(input) {
   if (!input) return null;
@@ -27,8 +22,8 @@ function parseTopicId(input) {
     const id = u.searchParams.get("topicId");
     return id && /^\d+$/.test(id) ? id : null;
   } catch {
-    const match = String(input).match(/topicId=(\d+)/);
-    return match ? match[1] : null;
+    const m = String(input).match(/topicId=(\d+)/);
+    return m ? m[1] : null;
   }
 }
 
@@ -42,15 +37,14 @@ function join(base, p) {
   return `${b}${pp}`;
 }
 
-function isPlainObject(x) {
+function isObj(x) {
   return x && typeof x === "object" && !Array.isArray(x);
 }
 
 /**
  * Supports envelopes:
- * 1) { code, msg, result }
- * 2) { errno, errmsg, result }
- * If no envelope: returns raw payload.
+ * - { code, msg, result }
+ * - { errno, errmsg, result }
  */
 async function openApiGet(pathnameAndQuery) {
   const url = join(OPINION_API_BASE, pathnameAndQuery);
@@ -71,103 +65,32 @@ async function openApiGet(pathnameAndQuery) {
     throw new Error(`Non-JSON response: ${text.slice(0, 300)}`);
   }
 
-  // code/msg/result
-  if (isPlainObject(payload) && "result" in payload && "code" in payload) {
-    if (Number(payload.code) !== 0) {
-      throw new Error(payload.msg || "OpenAPI error");
-    }
+  if (isObj(payload) && "result" in payload && "code" in payload) {
+    if (Number(payload.code) !== 0) throw new Error(payload.msg || "OpenAPI error");
     return payload.result;
   }
 
-  // errno/errmsg/result
-  if (isPlainObject(payload) && "result" in payload && "errno" in payload) {
-    if (Number(payload.errno) !== 0) {
-      throw new Error(payload.errmsg || "OpenAPI error");
-    }
+  if (isObj(payload) && "result" in payload && "errno" in payload) {
+    if (Number(payload.errno) !== 0) throw new Error(payload.errmsg || "OpenAPI error");
     return payload.result;
   }
 
   return payload;
 }
 
-function deepFindArrayByPredicate(root, itemPredicate) {
-  const seen = new Set();
-
-  function visit(node, depth) {
-    if (depth > 10 || node == null) return null;
-
-    if (typeof node === "object") {
-      if (seen.has(node)) return null;
-      seen.add(node);
-    }
-
-    if (Array.isArray(node)) {
-      const sample = node.slice(0, 20);
-      if (sample.some(itemPredicate)) return node;
-
-      for (const it of node) {
-        const found = visit(it, depth + 1);
-        if (found) return found;
-      }
-      return null;
-    }
-
-    if (isPlainObject(node)) {
-      // common containers first
-      const preferred = ["list", "data", "items", "rows", "records", "markets", "result"];
-      for (const k of preferred) {
-        if (k in node) {
-          const found = visit(node[k], depth + 1);
-          if (found) return found;
-        }
-      }
-      for (const k of Object.keys(node)) {
-        const found = visit(node[k], depth + 1);
-        if (found) return found;
-      }
-    }
-
-    return null;
-  }
-
-  return visit(root, 0);
-}
-
-function looksLikeMarketListItem(obj) {
-  if (!isPlainObject(obj)) return false;
-  // list item might NOT include token ids; require topicId + (id/marketId) at least
-  const hasTopic = obj.topicId !== undefined || obj.topic_id !== undefined;
-  const hasId =
-    obj.id !== undefined ||
-    obj.marketId !== undefined ||
-    obj.market_id !== undefined ||
-    obj.mid !== undefined;
-  return hasTopic && hasId;
-}
-
-function looksLikeMarketDetail(obj) {
-  if (!isPlainObject(obj)) return false;
-  const hasTopic = obj.topicId !== undefined || obj.topic_id !== undefined;
-  const hasYes = obj.yesTokenId !== undefined || obj.yes_token_id !== undefined;
-  const hasNo = obj.noTokenId !== undefined || obj.no_token_id !== undefined;
-  return hasTopic && (hasYes || hasNo);
+function pickTopicId(m) {
+  return m?.topicId ?? m?.topic_id ?? m?.topicID ?? null;
 }
 
 function pickMarketId(m) {
-  return m.id ?? m.marketId ?? m.market_id ?? m.mid ?? null;
-}
-
-function pickTopicId(m) {
-  return m.topicId ?? m.topic_id ?? null;
+  return m?.id ?? m?.marketId ?? m?.market_id ?? m?.mid ?? null;
 }
 
 function pickTokenIds(m) {
-  const yesTokenId = m.yesTokenId ?? m.yes_token_id ?? null;
-  const noTokenId = m.noTokenId ?? m.no_token_id ?? null;
+  const yesTokenId = m?.yesTokenId ?? m?.yes_token_id ?? null;
+  const noTokenId = m?.noTokenId ?? m?.no_token_id ?? null;
   return { yesTokenId, noTokenId };
 }
-
-/* ---------------- scoring ---------------- */
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
   if (!orderbook || !mid) return 0;
@@ -212,22 +135,11 @@ function formatNumber(value) {
   return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
-function extractHistoryPoints(historyResult) {
-  if (Array.isArray(historyResult)) return historyResult;
-  if (isPlainObject(historyResult)) {
-    const candidates = [
-      historyResult.history,
-      historyResult.data,
-      historyResult.items,
-      historyResult.list,
-      historyResult.records,
-      historyResult.rows,
-      historyResult.prices,
-    ];
-    for (const c of candidates) if (Array.isArray(c)) return c;
-
-    const found = deepFindArrayByPredicate(historyResult, (x) => isPlainObject(x) && ("price" in x || "p" in x));
-    return found || [];
+function extractHistoryPoints(history) {
+  if (Array.isArray(history)) return history;
+  if (isObj(history)) {
+    const cands = [history.data, history.list, history.items, history.records, history.rows, history.history, history.prices];
+    for (const c of cands) if (Array.isArray(c)) return c;
   }
   return [];
 }
@@ -253,16 +165,47 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   return { bestBid, bestAsk, mid, spreadPercent, depth, movePercent, volume24h };
 }
 
-/* ---------------- market discovery ---------------- */
+async function getMarketListPage(page, limit) {
+  // We already know result has { total, list }
+  const r = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=2`);
+  if (!isObj(r) || !Array.isArray(r.list)) {
+    const keys = isObj(r) ? Object.keys(r) : null;
+    throw new Error(`Unexpected market list shape. keys=${JSON.stringify(keys)}`);
+  }
+  return r;
+}
 
-async function fetchMarketsRoot() {
-  // don’t over-guess, just a couple realistic options
+async function findMarketByTopicId(topicId) {
+  const limit = 20;
+  let page = 1;
+
+  const first = await getMarketListPage(page, limit);
+  const total = Number(first.total || 0);
+  const pages = total ? Math.ceil(total / limit) : 50;
+
+  const findIn = (list) =>
+    list.find((m) => String(pickTopicId(m)) === String(topicId)) || null;
+
+  let found = findIn(first.list);
+  if (found) return found;
+
+  const maxPages = Math.min(pages, 80);
+  for (page = 2; page <= maxPages; page++) {
+    const r = await getMarketListPage(page, limit);
+    found = findIn(r.list);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function fetchMarketDetailById(marketId) {
+  const id = encodeURIComponent(String(marketId));
   const candidates = [
-    "/market?page=1&limit=20&marketType=2",
-    "/market?page=1&limit=20",
-    "/market?page=1",
-    "/market",
+    `/market/${id}`,
+    `/market/detail?market_id=${id}`,
+    `/market/detail?id=${id}`,
   ];
+
   let lastErr = null;
   for (const c of candidates) {
     try {
@@ -271,87 +214,25 @@ async function fetchMarketsRoot() {
       lastErr = e;
     }
   }
-  throw lastErr || new Error("Failed to fetch markets");
-}
-
-async function fetchMarketDetailById(marketId) {
-  const id = encodeURIComponent(String(marketId));
-  const candidates = [
-    `/market/${id}`,
-    `/market/detail?market_id=${id}`,
-  ];
-  let lastErr = null;
-  for (const c of candidates) {
-    try {
-      const r = await openApiGet(c);
-      // Sometimes detail is wrapped; find object that looks like a market detail
-      if (looksLikeMarketDetail(r)) return r;
-
-      const maybe = isPlainObject(r)
-        ? (deepFindArrayByPredicate(r, looksLikeMarketDetail)?.[0] || null)
-        : null;
-
-      if (maybe) return maybe;
-      // If it's an object but not matching, still return it (might contain token ids with different names)
-      if (isPlainObject(r)) return r;
-
-    } catch (e) {
-      lastErr = e;
-    }
-  }
   throw lastErr || new Error("Failed to fetch market detail");
-}
-
-async function findMarketByTopicId(topicId) {
-  const root = await fetchMarketsRoot();
-
-  // find list item array by topicId+id
-  const marketsList = deepFindArrayByPredicate(root, looksLikeMarketListItem);
-  if (!Array.isArray(marketsList)) {
-    throw new Error(`Could not locate markets list array. rootKeys=${JSON.stringify(isPlainObject(root) ? Object.keys(root).slice(0, 60) : null)}`);
-  }
-
-  const listItem = marketsList.find((m) => String(pickTopicId(m)) === String(topicId));
-  if (!listItem) return null;
-
-  // If list already has token ids, we’re done
-  const tokens = pickTokenIds(listItem);
-  if (tokens.yesTokenId && tokens.noTokenId) return listItem;
-
-  // Otherwise, fetch detail by id
-  const marketId = pickMarketId(listItem);
-  if (!marketId) return listItem;
-
-  const detail = await fetchMarketDetailById(marketId);
-  // merge list + detail
-  return { ...listItem, ...detail };
 }
 
 /* ---------------- endpoints ---------------- */
 
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    base: OPINION_API_BASE,
-    hasKey: Boolean(OPINION_API_KEY),
-  });
+  res.json({ ok: true, base: OPINION_API_BASE, hasKey: Boolean(OPINION_API_KEY) });
 });
 
 app.get("/api/debug", async (req, res) => {
   try {
-    const root = await fetchMarketsRoot();
-
-    const marketsList = deepFindArrayByPredicate(root, looksLikeMarketListItem);
-    const sample = Array.isArray(marketsList) ? marketsList[0] : null;
-
+    const r = await getMarketListPage(1, 1);
     res.json({
       ok: true,
       base: OPINION_API_BASE,
-      rootKeys: isPlainObject(root) ? Object.keys(root).slice(0, 60) : null,
-      marketsFound: Array.isArray(marketsList),
-      marketsCount: Array.isArray(marketsList) ? marketsList.length : null,
-      sampleKeys: sample && isPlainObject(sample) ? Object.keys(sample).slice(0, 60) : null,
-      sample,
+      total: r.total ?? null,
+      listType: Array.isArray(r.list) ? "array" : typeof r.list,
+      sampleKeys: r.list?.[0] ? Object.keys(r.list[0]).slice(0, 60) : null,
+      sample: r.list?.[0] ?? null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -366,19 +247,28 @@ app.post("/api/analyze", async (req, res) => {
   if (!OPINION_API_KEY) return res.status(500).json({ error: "Missing API key." });
 
   try {
-    const market = await findMarketByTopicId(topicId);
+    let market = await findMarketByTopicId(topicId);
     if (!market) return res.status(404).json({ error: "Market not found for topicId." });
 
-    const { yesTokenId, noTokenId } = pickTokenIds(market);
+    let { yesTokenId, noTokenId } = pickTokenIds(market);
+
+    if (!yesTokenId || !noTokenId) {
+      const marketId = pickMarketId(market);
+      if (marketId) {
+        const detail = await fetchMarketDetailById(marketId);
+        market = { ...market, ...(isObj(detail) ? detail : {}) };
+        ({ yesTokenId, noTokenId } = pickTokenIds(market));
+      }
+    }
+
     if (!yesTokenId || !noTokenId) {
       return res.status(500).json({
         error: "Could not resolve yes/no token IDs for this market.",
-        hint: "Market list may not include token IDs and market detail endpoint might differ.",
-        marketSampleKeys: isPlainObject(market) ? Object.keys(market).slice(0, 80) : null,
+        marketKeys: isObj(market) ? Object.keys(market).slice(0, 120) : null,
       });
     }
 
-    const volume24h = Number(market.volume24h ?? market.volume_24h ?? market.volume ?? 0);
+    const volume24h = Number(market.volume24h ?? market.volume_24h ?? 0);
 
     const tokenRequests = [
       { side: "YES", tokenId: yesTokenId },
@@ -429,7 +319,7 @@ app.post("/api/analyze", async (req, res) => {
 
         return {
           side,
-          tokenLabel: side, // keep frontend compatibility
+          tokenLabel: side,
           tokenId,
           verdict,
           confidence,
@@ -459,5 +349,4 @@ app.post("/api/analyze", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Opinion IQ running on http://localhost:${PORT}`);
-  console.log(`Base: ${OPINION_API_BASE}`);
 });
