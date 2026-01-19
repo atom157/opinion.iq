@@ -122,10 +122,10 @@ app.post("/api/analyze", async (req, res) => {
   }
 
   try {
-    const marketUrl = `${OPINION_API_BASE}/markets/${topicId}`;
-    const priceUrl = `${OPINION_API_BASE}/markets/${topicId}/price`;
-    const orderbookUrl = `${OPINION_API_BASE}/markets/${topicId}/orderbook`;
-    const historyUrl = `${OPINION_API_BASE}/markets/${topicId}/history?interval=1h&limit=48`;
+    const marketUrl = `${OPINION_API_BASE}/market/${topicId}`;
+    const priceUrl = `${OPINION_API_BASE}/market/${topicId}/price`;
+    const orderbookUrl = `${OPINION_API_BASE}/market/${topicId}/orderbook`;
+    const historyUrl = `${OPINION_API_BASE}/market/${topicId}/history?interval=1h&limit=48`;
 
     const [market, latestPrice, orderbook, history] = await Promise.all([
       fetchJson(marketUrl),
