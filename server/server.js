@@ -268,6 +268,15 @@ app.get("/api/debug", async (req, res) => {
  * MAIN: analyze by marketId (root or child)
  * POST /api/analyze  { marketId: 1588 }
  */
+app.get("/api/analyze", async (req, res) => {
+  const marketId = req.query.marketId;
+  if (!marketId) {
+    return res.status(400).json({ error: "marketId required" });
+  }
+  req.body = { marketId };
+  return app._router.handle(req, res, () => {});
+});
+
 app.post("/api/analyze", async (req, res) => {
   const marketId = parseMarketId(req.body?.marketId);
 
