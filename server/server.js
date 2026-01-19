@@ -15,23 +15,8 @@ const OPINION_API_KEY = String(process.env.OPINION_API_KEY || "").trim();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-function parseTopicId(input) {
-  if (!input) return null;
-  try {
-    const u = new URL(input);
-    const id = u.searchParams.get("topicId");
-    return id && /^\d+$/.test(id) ? id : null;
-  } catch {
-    const m = String(input).match(/topicId=(\d+)/);
-    return m ? m[1] : null;
-  }
-}
-
 function headers() {
-  return {
-    accept: "application/json",
-    apikey: OPINION_API_KEY,
-  };
+  return { accept: "application/json", apikey: OPINION_API_KEY };
 }
 
 function join(base, p) {
@@ -48,7 +33,7 @@ function isObj(x) {
  * Supports envelopes:
  * - { code, msg, result }
  * - { errno, errmsg, result }
- * Logs full URL + response body on API errors.
+ * Otherwise returns payload as-is
  */
 async function openApiGet(pathnameAndQuery) {
   const url = join(OPINION_API_BASE, pathnameAndQuery);
@@ -70,22 +55,40 @@ async function openApiGet(pathnameAndQuery) {
   }
 
   if (isObj(payload) && "result" in payload && "code" in payload) {
-    if (Number(payload.code) !== 0) {
-      console.error(`OpenAPI code!=0 for ${url}: ${text}`);
-      throw new Error(payload.msg || "OpenAPI error");
-    }
+    if (Number(payload.code) !== 0) throw new Error(payload.msg || "OpenAPI error");
     return payload.result;
   }
 
   if (isObj(payload) && "result" in payload && "errno" in payload) {
-    if (Number(payload.errno) !== 0) {
-      console.error(`OpenAPI errno!=0 for ${url}: ${text}`);
-      throw new Error(payload.errmsg || "OpenAPI error");
-    }
+    if (Number(payload.errno) !== 0) throw new Error(payload.errmsg || "OpenAPI error");
     return payload.result;
   }
 
   return payload;
+}
+
+function parseMarketId(input) {
+  if (input == null) return null;
+  const s = String(input).trim();
+  if (!s) return null;
+
+  // allow pasting URL with marketId=123
+  try {
+    const u = new URL(s);
+    const mid = u.searchParams.get("marketId") || u.searchParams.get("market_id") || u.searchParams.get("id");
+    if (mid && /^\d+$/.test(mid)) return mid;
+  } catch {}
+
+  // plain number
+  if (/^\d+$/.test(s)) return s;
+
+  // fallback regex
+  const m = s.match(/market(?:Id|_id)?=(\d+)/i);
+  return m ? m[1] : null;
+}
+
+function pickMarketId(m) {
+  return m?.marketId ?? m?.market_id ?? m?.id ?? null;
 }
 
 function pickTokenIds(m) {
@@ -151,9 +154,7 @@ function getVerdict(total) {
 }
 
 function formatNumber(value) {
-  return Number(value || 0).toLocaleString(undefined, {
-    maximumFractionDigits: 2,
-  });
+  return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
@@ -177,156 +178,122 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   return { bestBid, bestAsk, mid, spreadPercent, depth, movePercent, volume24h };
 }
 
-/** /market returns { total, list } */
 async function getMarketListPage(page, limit) {
+  // OpenAPI list returns { total, list }
   const r = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=2`);
   if (!isObj(r) || !Array.isArray(r.list)) {
     const keys = isObj(r) ? Object.keys(r) : null;
-    throw new Error(`Unexpected /market shape. keys=${JSON.stringify(keys)}`);
+    throw new Error(`Unexpected market list shape. keys=${JSON.stringify(keys)}`);
   }
   return r;
 }
 
-function pickBestChildMarket(root) {
-  const kids = Array.isArray(root?.childMarkets) ? root.childMarkets : [];
-  if (!kids.length) return null;
-
-  const scored = kids
-    .map((k) => {
-      const { yesTokenId, noTokenId } = pickTokenIds(k);
-      const v24 = Number(k.volume24h ?? k.volume_24h ?? 0);
-      const v = Number(k.volume ?? 0);
-      const hasTokens = Boolean(yesTokenId && noTokenId);
-      return { k, score: (hasTokens ? 1e15 : 0) + v24 * 1e6 + v };
-    })
-    .sort((a, b) => b.score - a.score);
-
-  return scored[0]?.k || null;
-}
-
 /**
- * topicId in your UI behaves like marketId.
- * We scan ALL pages until found:
- * - root marketId === topicId
- * - OR childMarkets[].marketId === topicId
+ * Find market by marketId:
+ * - it can be a "root" market
+ * - or a child market inside root.childMarkets[]
  */
-async function findMarketByTopicId(topicId) {
-  const limit = 50;
+async function findByMarketId(targetMarketId) {
+  const limit = 20;
+  let page = 1;
 
-  const first = await getMarketListPage(1, limit);
+  const first = await getMarketListPage(page, limit);
   const total = Number(first.total || 0);
-  const pages = total ? Math.ceil(total / limit) : 1;
+  const pages = total ? Math.ceil(total / limit) : 50;
 
-  function scan(list) {
+  const scanList = (list) => {
     for (const root of list) {
-      // root hit
-      if (String(root.marketId) === String(topicId)) {
-        const { yesTokenId, noTokenId } = pickTokenIds(root);
-        if (yesTokenId && noTokenId) return { kind: "root", market: root, parent: null };
-
-        const bestChild = pickBestChildMarket(root);
-        if (bestChild) return { kind: "childOfRoot", market: bestChild, parent: root };
-
-        return { kind: "rootNoTokens", market: root, parent: null };
+      if (String(pickMarketId(root)) === String(targetMarketId)) {
+        return { foundKind: "root", market: root, parent: null };
       }
-
-      // child hit
       const kids = Array.isArray(root.childMarkets) ? root.childMarkets : [];
-      const hit = kids.find((c) => String(c.marketId) === String(topicId));
-      if (hit) return { kind: "child", market: hit, parent: root };
+      const child = kids.find((k) => String(pickMarketId(k)) === String(targetMarketId));
+      if (child) {
+        return { foundKind: "child", market: child, parent: root };
+      }
     }
     return null;
-  }
+  };
 
-  let found = scan(first.list);
-  if (found) return found;
+  let hit = scanList(first.list);
+  if (hit) return { ...hit, scannedPages: 1, total };
 
-  // hard limit for safety
-  const maxPages = Math.min(pages, 200);
-
-  for (let page = 2; page <= maxPages; page++) {
+  const maxPages = Math.min(pages, 120); // safety
+  for (page = 2; page <= maxPages; page++) {
     const r = await getMarketListPage(page, limit);
-    found = scan(r.list);
-    if (found) return found;
+    hit = scanList(r.list);
+    if (hit) return { ...hit, scannedPages: page, total };
   }
 
   return null;
 }
 
-/* ---------------- routes ---------------- */
+/* ---------------- endpoints ---------------- */
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, base: OPINION_API_BASE, hasKey: Boolean(OPINION_API_KEY) });
 });
 
-/**
- * /api/debug
- * /api/debug?marketId=61 -> scans pages until it finds root/child match
- */
+// debug: show sample and optionally find marketId
 app.get("/api/debug", async (req, res) => {
   try {
-    const target = String(req.query.marketId || "").trim();
-    const first = await getMarketListPage(1, 50);
+    const target = parseMarketId(req.query.marketId);
+    const page1 = await getMarketListPage(1, 20);
 
     let found = null;
-    if (target) found = await findMarketByTopicId(target);
+    if (target) found = await findByMarketId(target);
 
     res.json({
       ok: true,
       base: OPINION_API_BASE,
-      total: first.total ?? null,
-      scannedFirstPage: first.list.length,
+      total: page1.total ?? null,
+      scannedFirstPage: 20,
       target: target || null,
       found: Boolean(found),
-      foundKind: found?.kind || null,
-      foundMarketId: found?.market?.marketId ?? null,
+      foundKind: found?.foundKind ?? null,
+      foundMarketId: found?.market ? String(pickMarketId(found.market)) : null,
       foundMarketTitle: found?.market?.marketTitle ?? null,
-      foundHasTokens: Boolean(
-        (found?.market?.yesTokenId ?? found?.market?.yes_token_id) &&
-          (found?.market?.noTokenId ?? found?.market?.no_token_id)
-      ),
-      sampleKeys: first.list?.[0] ? Object.keys(first.list[0]).slice(0, 60) : null,
-      sample: first.list?.[0] ?? null,
+      foundHasTokens: Boolean(pickTokenIds(found?.market || {}).yesTokenId && pickTokenIds(found?.market || {}).noTokenId),
+      sampleKeys: page1.list?.[0] ? Object.keys(page1.list[0]).slice(0, 60) : null,
+      sample: page1.list?.[0] ?? null,
       note:
-        first.list?.[0] && (!first.list[0].yesTokenId || !first.list[0].noTokenId)
-          ? "If root yes/no empty, tokens are inside sample.childMarkets[]."
-          : null,
+        "If root yes/no empty, tokens are inside sample.childMarkets[]. Use /api/debug?marketId=<childMarketId>.",
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+/**
+ * MAIN: analyze by marketId (root or child)
+ * POST /api/analyze  { marketId: 1588 }
+ */
 app.post("/api/analyze", async (req, res) => {
-  const { url } = req.body || {};
-  const topicId = parseTopicId(url);
+  const marketId = parseMarketId(req.body?.marketId);
 
-  if (!topicId) return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
+  if (!marketId) return res.status(400).json({ error: "Provide marketId (number), e.g. 1588" });
   if (!OPINION_API_KEY) return res.status(500).json({ error: "Missing API key." });
 
   try {
-    const found = await findMarketByTopicId(topicId);
-    if (!found) return res.status(404).json({ error: "Market not found for topicId (marketId/child marketId)." });
+    const hit = await findByMarketId(marketId);
+    if (!hit) return res.status(404).json({ error: "Market not found by marketId. (Try /api/debug?marketId=...)" });
 
-    const chosenMarket = found.market;
-    const parentMarket = found.parent;
+    const market = hit.market;
+    const parent = hit.parent;
 
-    const { yesTokenId, noTokenId } = pickTokenIds(chosenMarket);
+    // tokens must exist on the actual tradable market (usually child)
+    let { yesTokenId, noTokenId } = pickTokenIds(market);
     if (!yesTokenId || !noTokenId) {
       return res.status(500).json({
-        error: "Found market but missing yes/no token IDs.",
-        foundKind: found.kind,
-        marketId: chosenMarket?.marketId ?? null,
-        marketKeys: isObj(chosenMarket) ? Object.keys(chosenMarket).slice(0, 120) : null,
+        error: "This marketId does not include yes/no token IDs. Use a child marketId.",
+        foundKind: hit.foundKind,
+        marketId: pickMarketId(market),
+        hint: "Open /api/debug and choose one of childMarkets[].marketId",
       });
     }
 
     const volume24h = Number(
-      chosenMarket.volume24h ??
-        chosenMarket.volume_24h ??
-        parentMarket?.volume24h ??
-        parentMarket?.volume_24h ??
-        0
+      market.volume24h ?? market.volume_24h ?? parent?.volume24h ?? parent?.volume_24h ?? 0
     );
 
     const tokenRequests = [
@@ -337,6 +304,7 @@ app.post("/api/analyze", async (req, res) => {
     const tokens = await Promise.all(
       tokenRequests.map(async ({ side, tokenId }) => {
         const q = encodeURIComponent(String(tokenId));
+
         const [latestPrice, orderbook, history] = await Promise.all([
           openApiGet(`/token/latest-price?token_id=${q}`),
           openApiGet(`/token/orderbook?token_id=${q}`),
@@ -350,9 +318,11 @@ app.post("/api/analyze", async (req, res) => {
         const moveScore = scoreInverseMetric(metrics.movePercent, { ok: 6, wait: 12 });
         const volumeScore = scoreMetric(metrics.volume24h, { ok: 50000, wait: 20000 });
 
-        const totalScore = liquidityScore.score + spreadScore.score + moveScore.score + volumeScore.score;
+        const totalScore =
+          liquidityScore.score + spreadScore.score + moveScore.score + volumeScore.score;
+
         const verdict = getVerdict(totalScore);
-        const confidence = Math.max(0, Math.min(100, Math.round(((totalScore + 4) / 8) * 100)));
+        const confidence = Math.round(((totalScore + 4) / 8) * 100);
 
         const facts = [
           { label: "Liquidity (top 1% depth)", value: `$${formatNumber(metrics.depth)}`, status: liquidityScore.label },
@@ -392,8 +362,10 @@ app.post("/api/analyze", async (req, res) => {
     const overallConfidence = Math.round(tokens.reduce((s, t) => s + t.confidence, 0) / tokens.length);
 
     res.json({
-      topicId,
-      market: { foundKind: found.kind, chosen: chosenMarket, parent: parentMarket || null },
+      marketId: Number(marketId),
+      foundKind: hit.foundKind,
+      market,
+      parentMarket: parent || null,
       overall: { verdict: overallVerdict, confidence: overallConfidence },
       tokens,
     });
