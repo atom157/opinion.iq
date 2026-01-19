@@ -7,24 +7,16 @@ const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
 /**
- * IMPORTANT:
- * OPINION_API_BASE must point to OpenAPI root:
- *   https://proxy.opinion.trade:8443/openapi
- * (NO /v1 here)
+ * Set in Railway:
+ * OPINION_API_BASE = https://openapi.opinion.trade/openapi
+ * OPINION_API_KEY  = ...
  */
-function normalizeOpenApiBase(raw) {
-  const b = String(raw || "").trim().replace(/\/+$/, "");
-  if (!b) return "";
-  // If user accidentally gives host without /openapi, append it.
-  return /\/openapi$/i.test(b) ? b : `${b}/openapi`;
-}
+const OPINION_API_BASE = String(
+  process.env.OPINION_API_BASE || "https://openapi.opinion.trade/openapi"
+).replace(/\/+$/, "");
 
-const OPINION_API_BASE = normalizeOpenApiBase(
-  process.env.OPINION_API_BASE || "https://proxy.opinion.trade:8443/openapi"
-);
-const OPINION_API_KEY = (process.env.OPINION_API_KEY || "").trim();
+const OPINION_API_KEY = String(process.env.OPINION_API_KEY || "").trim();
 
-if (!OPINION_API_BASE) console.warn("Missing OPINION_API_BASE.");
 if (!OPINION_API_KEY) console.warn("Missing OPINION_API_KEY.");
 
 app.use(express.json({ limit: "1mb" }));
@@ -45,21 +37,17 @@ function parseTopicId(input) {
 }
 
 function headers() {
-  return {
-    accept: "application/json",
-    apikey: OPINION_API_KEY,
-  };
+  return { accept: "application/json", apikey: OPINION_API_KEY };
 }
 
 function join(base, p) {
   const b = base.replace(/\/+$/, "");
-  const pathPart = String(p || "").startsWith("/") ? p : `/${p}`;
-  return `${b}${pathPart}`;
+  const pp = String(p || "").startsWith("/") ? p : `/${p}`;
+  return `${b}${pp}`;
 }
 
 /**
- * OpenAPI envelope:
- * { code, msg, result }
+ * OpenAPI envelope: { code, msg, result }
  */
 async function openApiGet(pathnameAndQuery) {
   const url = join(OPINION_API_BASE, pathnameAndQuery);
@@ -80,7 +68,7 @@ async function openApiGet(pathnameAndQuery) {
     throw new Error(`Non-JSON response: ${text.slice(0, 300)}`);
   }
 
-  if (payload && typeof payload === "object" && "code" in payload) {
+  if (payload && typeof payload === "object" && "code" in payload && "result" in payload) {
     if (payload.code !== 0) {
       console.error(`OpenAPI error for ${url}: ${JSON.stringify(payload)}`);
       throw new Error(payload.msg || "OpenAPI error");
@@ -88,20 +76,9 @@ async function openApiGet(pathnameAndQuery) {
     return payload.result;
   }
 
-  // fallback if API ever returns raw
+  // If API ever returns raw JSON (unexpected)
+  console.warn(`Warning: response without envelope for ${url}`);
   return payload;
-}
-
-function extractArray(x) {
-  if (Array.isArray(x)) return x;
-  if (x && typeof x === "object") {
-    if (Array.isArray(x.data)) return x.data;
-    if (Array.isArray(x.items)) return x.items;
-    if (Array.isArray(x.list)) return x.list;
-    if (Array.isArray(x.markets)) return x.markets;
-    if (Array.isArray(x.result)) return x.result;
-  }
-  return null;
 }
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
@@ -147,6 +124,17 @@ function formatNumber(value) {
   return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
+function extractHistoryPoints(historyResult) {
+  // docs don’t strictly guarantee shape in our conversation, so be defensive
+  if (Array.isArray(historyResult)) return historyResult;
+  if (historyResult && typeof historyResult === "object") {
+    if (Array.isArray(historyResult.data)) return historyResult.data;
+    if (Array.isArray(historyResult.list)) return historyResult.list;
+    if (Array.isArray(historyResult.items)) return historyResult.items;
+  }
+  return [];
+}
+
 function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   const bestBid = Number(orderbook?.bids?.[0]?.price || 0);
   const bestAsk = Number(orderbook?.asks?.[0]?.price || 0);
@@ -157,39 +145,67 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   const spreadPercent = mid ? ((bestAsk - bestBid) / mid) * 100 : 0;
   const depth = sumDepthWithinPercent(orderbook, mid, 1);
 
-  const pts = extractArray(history) || (Array.isArray(history) ? history : []);
+  const pts = extractHistoryPoints(history);
   let movePercent = 0;
   if (pts.length > 1) {
-    const latest = Number(pts[pts.length - 1]?.p ?? pts[pts.length - 1]?.price ?? 0);
-    const prior = Number(pts[pts.length - 2]?.p ?? pts[pts.length - 2]?.price ?? 0);
+    const latest = Number(pts[pts.length - 1]?.price ?? pts[pts.length - 1]?.p ?? 0);
+    const prior = Number(pts[pts.length - 2]?.price ?? pts[pts.length - 2]?.p ?? 0);
     if (prior) movePercent = Math.abs(((latest - prior) / prior) * 100);
   }
 
   return { bestBid, bestAsk, mid, spreadPercent, depth, movePercent, volume24h };
 }
 
+/**
+ * Get market by topicId (paginated /market).
+ * Docs: /openapi/market supports page, limit(max 20), marketType (0/1/2). :contentReference[oaicite:5]{index=5}
+ */
+async function findMarketByTopicId(topicId) {
+  const limit = 20;
+  const marketType = 2; // all
+  let page = 1;
+
+  // first page to get total + list
+  const first = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=${marketType}`);
+  const total = Number(first?.total || 0);
+  const pages = total ? Math.ceil(total / limit) : 50; // safe cap
+
+  const scanList = (list) => {
+    if (!Array.isArray(list)) return null;
+    return (
+      list.find((m) => String(m.topicId) === String(topicId)) ||
+      null
+    );
+  };
+
+  let found = scanList(first?.list);
+  if (found) return found;
+
+  const maxPages = Math.min(pages, 50); // don’t DOS yourself
+  for (page = 2; page <= maxPages; page++) {
+    const res = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=${marketType}`);
+    found = scanList(res?.list);
+    if (found) return found;
+  }
+
+  return null;
+}
+
 /* ---------------- endpoints ---------------- */
 
 app.get("/api/health", (req, res) => {
-  res.json({
-    ok: true,
-    base: OPINION_API_BASE,
-    hasKey: Boolean(OPINION_API_KEY),
-  });
+  res.json({ ok: true, base: OPINION_API_BASE, hasKey: Boolean(OPINION_API_KEY) });
 });
 
 app.get("/api/debug", async (req, res) => {
   try {
-    // According to docs, list markets is /market (not /v1/markets)
-    const result = await openApiGet("/market");
-    const arr = extractArray(result);
+    const r = await openApiGet("/market?page=1&limit=1&marketType=2");
     res.json({
       ok: true,
       base: OPINION_API_BASE,
-      rawType: Array.isArray(result) ? "array" : typeof result,
-      marketsType: arr ? "array" : "unknown",
-      sampleKeys: arr?.[0] && typeof arr[0] === "object" ? Object.keys(arr[0]).slice(0, 40) : null,
-      sample: arr?.[0] ?? null,
+      total: r?.total ?? null,
+      sampleKeys: r?.list?.[0] ? Object.keys(r.list[0]).slice(0, 40) : null,
+      sample: r?.list?.[0] ?? null,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -204,26 +220,17 @@ app.post("/api/analyze", async (req, res) => {
   if (!OPINION_API_KEY) return res.status(500).json({ error: "Missing API key." });
 
   try {
-    // 1) Load all markets, find by topicId
-    const marketsResult = await openApiGet("/market");
-    const markets = extractArray(marketsResult);
-
-    if (!markets) {
-      return res.status(500).json({
-        error: "Market list endpoint returned unexpected format (expected array).",
-        debug: { got: typeof marketsResult },
-      });
-    }
-
-    const market = markets.find((m) => String(m.topicId) === String(topicId));
+    const market = await findMarketByTopicId(topicId);
     if (!market) return res.status(404).json({ error: "Market not found for topicId." });
 
-    // 2) token ids
     const yesTokenId = market.yesTokenId ?? market.yes_token_id;
     const noTokenId = market.noTokenId ?? market.no_token_id;
-    if (!yesTokenId || !noTokenId) return res.status(500).json({ error: "Market data missing token IDs." });
 
-    const volume24h = Number(market.volume24h ?? market.volume_24h ?? market.volume ?? 0);
+    if (!yesTokenId || !noTokenId) {
+      return res.status(500).json({ error: "Market data missing yes/no token IDs." });
+    }
+
+    const volume24h = Number(market.volume24h ?? market.volume_24h ?? 0);
 
     const tokenRequests = [
       { side: "YES", tokenId: yesTokenId },
@@ -304,5 +311,5 @@ app.post("/api/analyze", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Opinion IQ running on http://localhost:${PORT}`);
-  console.log(`OpenAPI base: ${OPINION_API_BASE}`);
+  console.log(`Base: ${OPINION_API_BASE}`);
 });
