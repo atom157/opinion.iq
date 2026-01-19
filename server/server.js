@@ -7,7 +7,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
 /**
- * Set in Railway:
+ * Railway Variables:
  * OPINION_API_BASE = https://openapi.opinion.trade/openapi
  * OPINION_API_KEY  = ...
  */
@@ -17,6 +17,7 @@ const OPINION_API_BASE = String(
 
 const OPINION_API_KEY = String(process.env.OPINION_API_KEY || "").trim();
 
+if (!OPINION_API_BASE) console.warn("Missing OPINION_API_BASE.");
 if (!OPINION_API_KEY) console.warn("Missing OPINION_API_KEY.");
 
 app.use(express.json({ limit: "1mb" }));
@@ -68,6 +69,7 @@ async function openApiGet(pathnameAndQuery) {
     throw new Error(`Non-JSON response: ${text.slice(0, 300)}`);
   }
 
+  // Strict envelope handling
   if (payload && typeof payload === "object" && "code" in payload && "result" in payload) {
     if (payload.code !== 0) {
       console.error(`OpenAPI error for ${url}: ${JSON.stringify(payload)}`);
@@ -76,9 +78,71 @@ async function openApiGet(pathnameAndQuery) {
     return payload.result;
   }
 
-  // If API ever returns raw JSON (unexpected)
-  console.warn(`Warning: response without envelope for ${url}`);
+  // Fallback: raw JSON (rare)
   return payload;
+}
+
+function isPlainObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
+}
+
+function looksLikeMarket(obj) {
+  if (!isPlainObject(obj)) return false;
+  const hasTopic = obj.topicId !== undefined || obj.topic_id !== undefined;
+  const hasYes = obj.yesTokenId !== undefined || obj.yes_token_id !== undefined;
+  const hasNo = obj.noTokenId !== undefined || obj.no_token_id !== undefined;
+  return hasTopic && (hasYes || hasNo);
+}
+
+/**
+ * Deep-search for an array that "looks like markets".
+ * It will find arrays under: list/data/items/rows/records/... or any nested property.
+ */
+function deepFindMarketsArray(root) {
+  const seen = new Set();
+
+  function visit(node, depth) {
+    if (depth > 10) return null;
+    if (!node) return null;
+
+    if (typeof node === "object") {
+      if (seen.has(node)) return null;
+      seen.add(node);
+    }
+
+    if (Array.isArray(node)) {
+      // check if array elements look like markets
+      const sample = node.slice(0, 10);
+      const score = sample.filter(looksLikeMarket).length;
+      if (score >= 1) return node; // at least one market-like item
+      // otherwise, search inside elements
+      for (const it of node) {
+        const found = visit(it, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    if (isPlainObject(node)) {
+      // common containers first (fast path)
+      const preferredKeys = ["list", "data", "items", "rows", "records", "markets", "result"];
+      for (const k of preferredKeys) {
+        if (k in node) {
+          const found = visit(node[k], depth + 1);
+          if (found) return found;
+        }
+      }
+      // then search all keys
+      for (const k of Object.keys(node)) {
+        const found = visit(node[k], depth + 1);
+        if (found) return found;
+      }
+    }
+
+    return null;
+  }
+
+  return visit(root, 0);
 }
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
@@ -125,13 +189,50 @@ function formatNumber(value) {
 }
 
 function extractHistoryPoints(historyResult) {
-  // docs don’t strictly guarantee shape in our conversation, so be defensive
+  // Accept arrays or nested arrays
   if (Array.isArray(historyResult)) return historyResult;
-  if (historyResult && typeof historyResult === "object") {
-    if (Array.isArray(historyResult.data)) return historyResult.data;
-    if (Array.isArray(historyResult.list)) return historyResult.list;
-    if (Array.isArray(historyResult.items)) return historyResult.items;
+
+  if (isPlainObject(historyResult)) {
+    const candidates = [
+      historyResult.history,
+      historyResult.data,
+      historyResult.items,
+      historyResult.list,
+      historyResult.records,
+      historyResult.rows,
+    ];
+    for (const c of candidates) if (Array.isArray(c)) return c;
+
+    // deep search any array of objects with price/p keys
+    const seen = new Set();
+    function visit(node, depth) {
+      if (depth > 8) return null;
+      if (!node) return null;
+      if (typeof node === "object") {
+        if (seen.has(node)) return null;
+        seen.add(node);
+      }
+      if (Array.isArray(node)) {
+        const sample = node.slice(0, 10);
+        const ok = sample.some((x) => isPlainObject(x) && (("price" in x) || ("p" in x)));
+        if (ok) return node;
+        for (const it of node) {
+          const f = visit(it, depth + 1);
+          if (f) return f;
+        }
+        return null;
+      }
+      if (isPlainObject(node)) {
+        for (const k of Object.keys(node)) {
+          const f = visit(node[k], depth + 1);
+          if (f) return f;
+        }
+      }
+      return null;
+    }
+    return visit(historyResult, 0) || [];
   }
+
   return [];
 }
 
@@ -157,38 +258,40 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
 }
 
 /**
- * Get market by topicId (paginated /market).
- * Docs: /openapi/market supports page, limit(max 20), marketType (0/1/2). :contentReference[oaicite:5]{index=5}
+ * Market list endpoints (try a few common variants).
+ * We don't guess forever—just sensible fallbacks.
  */
+async function fetchMarketsResult() {
+  const candidates = [
+    "/market?page=1&limit=20&marketType=2",
+    "/market?page=1&limit=20",
+    "/market?page=1",
+    "/market",
+  ];
+
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      return await openApiGet(c);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Failed to fetch markets");
+}
+
 async function findMarketByTopicId(topicId) {
-  const limit = 20;
-  const marketType = 2; // all
-  let page = 1;
+  const result = await fetchMarketsResult();
+  const markets = deepFindMarketsArray(result);
 
-  // first page to get total + list
-  const first = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=${marketType}`);
-  const total = Number(first?.total || 0);
-  const pages = total ? Math.ceil(total / limit) : 50; // safe cap
-
-  const scanList = (list) => {
-    if (!Array.isArray(list)) return null;
-    return (
-      list.find((m) => String(m.topicId) === String(topicId)) ||
-      null
-    );
-  };
-
-  let found = scanList(first?.list);
-  if (found) return found;
-
-  const maxPages = Math.min(pages, 50); // don’t DOS yourself
-  for (page = 2; page <= maxPages; page++) {
-    const res = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=${marketType}`);
-    found = scanList(res?.list);
-    if (found) return found;
+  if (!Array.isArray(markets)) {
+    // give a clean error
+    const keys = isPlainObject(result) ? Object.keys(result).slice(0, 60) : null;
+    throw new Error(`Could not locate markets array in API result. resultKeys=${JSON.stringify(keys)}`);
   }
 
-  return null;
+  const found = markets.find((m) => String(m.topicId ?? m.topic_id) === String(topicId));
+  return found || null;
 }
 
 /* ---------------- endpoints ---------------- */
@@ -199,13 +302,19 @@ app.get("/api/health", (req, res) => {
 
 app.get("/api/debug", async (req, res) => {
   try {
-    const r = await openApiGet("/market?page=1&limit=1&marketType=2");
+    const result = await fetchMarketsResult();
+    const markets = deepFindMarketsArray(result);
+
+    const sample = Array.isArray(markets) ? markets[0] : null;
     res.json({
       ok: true,
       base: OPINION_API_BASE,
-      total: r?.total ?? null,
-      sampleKeys: r?.list?.[0] ? Object.keys(r.list[0]).slice(0, 40) : null,
-      sample: r?.list?.[0] ?? null,
+      resultType: Array.isArray(result) ? "array" : typeof result,
+      resultKeys: isPlainObject(result) ? Object.keys(result).slice(0, 60) : null,
+      marketsFound: Array.isArray(markets),
+      marketsCount: Array.isArray(markets) ? markets.length : null,
+      sampleKeys: sample && typeof sample === "object" ? Object.keys(sample).slice(0, 60) : null,
+      sample,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -225,12 +334,9 @@ app.post("/api/analyze", async (req, res) => {
 
     const yesTokenId = market.yesTokenId ?? market.yes_token_id;
     const noTokenId = market.noTokenId ?? market.no_token_id;
+    if (!yesTokenId || !noTokenId) return res.status(500).json({ error: "Market data missing token IDs." });
 
-    if (!yesTokenId || !noTokenId) {
-      return res.status(500).json({ error: "Market data missing yes/no token IDs." });
-    }
-
-    const volume24h = Number(market.volume24h ?? market.volume_24h ?? 0);
+    const volume24h = Number(market.volume24h ?? market.volume_24h ?? market.volume ?? 0);
 
     const tokenRequests = [
       { side: "YES", tokenId: yesTokenId },
