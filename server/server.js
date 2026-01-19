@@ -6,11 +6,6 @@ require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-/**
- * Railway Variables:
- * OPINION_API_BASE = https://openapi.opinion.trade/openapi
- * OPINION_API_KEY  = ...
- */
 const OPINION_API_BASE = String(
   process.env.OPINION_API_BASE || "https://openapi.opinion.trade/openapi"
 ).replace(/\/+$/, "");
@@ -47,8 +42,15 @@ function join(base, p) {
   return `${b}${pp}`;
 }
 
+function isPlainObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x);
+}
+
 /**
- * OpenAPI envelope: { code, msg, result }
+ * Supports envelopes:
+ * 1) { code, msg, result }
+ * 2) { errno, errmsg, result }
+ * If no envelope: returns raw payload.
  */
 async function openApiGet(pathnameAndQuery) {
   const url = join(OPINION_API_BASE, pathnameAndQuery);
@@ -69,41 +71,30 @@ async function openApiGet(pathnameAndQuery) {
     throw new Error(`Non-JSON response: ${text.slice(0, 300)}`);
   }
 
-  // Strict envelope handling
-  if (payload && typeof payload === "object" && "code" in payload && "result" in payload) {
-    if (payload.code !== 0) {
-      console.error(`OpenAPI error for ${url}: ${JSON.stringify(payload)}`);
+  // code/msg/result
+  if (isPlainObject(payload) && "result" in payload && "code" in payload) {
+    if (Number(payload.code) !== 0) {
       throw new Error(payload.msg || "OpenAPI error");
     }
     return payload.result;
   }
 
-  // Fallback: raw JSON (rare)
+  // errno/errmsg/result
+  if (isPlainObject(payload) && "result" in payload && "errno" in payload) {
+    if (Number(payload.errno) !== 0) {
+      throw new Error(payload.errmsg || "OpenAPI error");
+    }
+    return payload.result;
+  }
+
   return payload;
 }
 
-function isPlainObject(x) {
-  return x && typeof x === "object" && !Array.isArray(x);
-}
-
-function looksLikeMarket(obj) {
-  if (!isPlainObject(obj)) return false;
-  const hasTopic = obj.topicId !== undefined || obj.topic_id !== undefined;
-  const hasYes = obj.yesTokenId !== undefined || obj.yes_token_id !== undefined;
-  const hasNo = obj.noTokenId !== undefined || obj.no_token_id !== undefined;
-  return hasTopic && (hasYes || hasNo);
-}
-
-/**
- * Deep-search for an array that "looks like markets".
- * It will find arrays under: list/data/items/rows/records/... or any nested property.
- */
-function deepFindMarketsArray(root) {
+function deepFindArrayByPredicate(root, itemPredicate) {
   const seen = new Set();
 
   function visit(node, depth) {
-    if (depth > 10) return null;
-    if (!node) return null;
+    if (depth > 10 || node == null) return null;
 
     if (typeof node === "object") {
       if (seen.has(node)) return null;
@@ -111,11 +102,9 @@ function deepFindMarketsArray(root) {
     }
 
     if (Array.isArray(node)) {
-      // check if array elements look like markets
-      const sample = node.slice(0, 10);
-      const score = sample.filter(looksLikeMarket).length;
-      if (score >= 1) return node; // at least one market-like item
-      // otherwise, search inside elements
+      const sample = node.slice(0, 20);
+      if (sample.some(itemPredicate)) return node;
+
       for (const it of node) {
         const found = visit(it, depth + 1);
         if (found) return found;
@@ -124,15 +113,14 @@ function deepFindMarketsArray(root) {
     }
 
     if (isPlainObject(node)) {
-      // common containers first (fast path)
-      const preferredKeys = ["list", "data", "items", "rows", "records", "markets", "result"];
-      for (const k of preferredKeys) {
+      // common containers first
+      const preferred = ["list", "data", "items", "rows", "records", "markets", "result"];
+      for (const k of preferred) {
         if (k in node) {
           const found = visit(node[k], depth + 1);
           if (found) return found;
         }
       }
-      // then search all keys
       for (const k of Object.keys(node)) {
         const found = visit(node[k], depth + 1);
         if (found) return found;
@@ -144,6 +132,42 @@ function deepFindMarketsArray(root) {
 
   return visit(root, 0);
 }
+
+function looksLikeMarketListItem(obj) {
+  if (!isPlainObject(obj)) return false;
+  // list item might NOT include token ids; require topicId + (id/marketId) at least
+  const hasTopic = obj.topicId !== undefined || obj.topic_id !== undefined;
+  const hasId =
+    obj.id !== undefined ||
+    obj.marketId !== undefined ||
+    obj.market_id !== undefined ||
+    obj.mid !== undefined;
+  return hasTopic && hasId;
+}
+
+function looksLikeMarketDetail(obj) {
+  if (!isPlainObject(obj)) return false;
+  const hasTopic = obj.topicId !== undefined || obj.topic_id !== undefined;
+  const hasYes = obj.yesTokenId !== undefined || obj.yes_token_id !== undefined;
+  const hasNo = obj.noTokenId !== undefined || obj.no_token_id !== undefined;
+  return hasTopic && (hasYes || hasNo);
+}
+
+function pickMarketId(m) {
+  return m.id ?? m.marketId ?? m.market_id ?? m.mid ?? null;
+}
+
+function pickTopicId(m) {
+  return m.topicId ?? m.topic_id ?? null;
+}
+
+function pickTokenIds(m) {
+  const yesTokenId = m.yesTokenId ?? m.yes_token_id ?? null;
+  const noTokenId = m.noTokenId ?? m.no_token_id ?? null;
+  return { yesTokenId, noTokenId };
+}
+
+/* ---------------- scoring ---------------- */
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
   if (!orderbook || !mid) return 0;
@@ -189,9 +213,7 @@ function formatNumber(value) {
 }
 
 function extractHistoryPoints(historyResult) {
-  // Accept arrays or nested arrays
   if (Array.isArray(historyResult)) return historyResult;
-
   if (isPlainObject(historyResult)) {
     const candidates = [
       historyResult.history,
@@ -200,39 +222,13 @@ function extractHistoryPoints(historyResult) {
       historyResult.list,
       historyResult.records,
       historyResult.rows,
+      historyResult.prices,
     ];
     for (const c of candidates) if (Array.isArray(c)) return c;
 
-    // deep search any array of objects with price/p keys
-    const seen = new Set();
-    function visit(node, depth) {
-      if (depth > 8) return null;
-      if (!node) return null;
-      if (typeof node === "object") {
-        if (seen.has(node)) return null;
-        seen.add(node);
-      }
-      if (Array.isArray(node)) {
-        const sample = node.slice(0, 10);
-        const ok = sample.some((x) => isPlainObject(x) && (("price" in x) || ("p" in x)));
-        if (ok) return node;
-        for (const it of node) {
-          const f = visit(it, depth + 1);
-          if (f) return f;
-        }
-        return null;
-      }
-      if (isPlainObject(node)) {
-        for (const k of Object.keys(node)) {
-          const f = visit(node[k], depth + 1);
-          if (f) return f;
-        }
-      }
-      return null;
-    }
-    return visit(historyResult, 0) || [];
+    const found = deepFindArrayByPredicate(historyResult, (x) => isPlainObject(x) && ("price" in x || "p" in x));
+    return found || [];
   }
-
   return [];
 }
 
@@ -257,18 +253,16 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   return { bestBid, bestAsk, mid, spreadPercent, depth, movePercent, volume24h };
 }
 
-/**
- * Market list endpoints (try a few common variants).
- * We don't guess forever—just sensible fallbacks.
- */
-async function fetchMarketsResult() {
+/* ---------------- market discovery ---------------- */
+
+async function fetchMarketsRoot() {
+  // don’t over-guess, just a couple realistic options
   const candidates = [
     "/market?page=1&limit=20&marketType=2",
     "/market?page=1&limit=20",
     "/market?page=1",
     "/market",
   ];
-
   let lastErr = null;
   for (const c of candidates) {
     try {
@@ -280,40 +274,83 @@ async function fetchMarketsResult() {
   throw lastErr || new Error("Failed to fetch markets");
 }
 
-async function findMarketByTopicId(topicId) {
-  const result = await fetchMarketsResult();
-  const markets = deepFindMarketsArray(result);
+async function fetchMarketDetailById(marketId) {
+  const id = encodeURIComponent(String(marketId));
+  const candidates = [
+    `/market/${id}`,
+    `/market/detail?market_id=${id}`,
+  ];
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      const r = await openApiGet(c);
+      // Sometimes detail is wrapped; find object that looks like a market detail
+      if (looksLikeMarketDetail(r)) return r;
 
-  if (!Array.isArray(markets)) {
-    // give a clean error
-    const keys = isPlainObject(result) ? Object.keys(result).slice(0, 60) : null;
-    throw new Error(`Could not locate markets array in API result. resultKeys=${JSON.stringify(keys)}`);
+      const maybe = isPlainObject(r)
+        ? (deepFindArrayByPredicate(r, looksLikeMarketDetail)?.[0] || null)
+        : null;
+
+      if (maybe) return maybe;
+      // If it's an object but not matching, still return it (might contain token ids with different names)
+      if (isPlainObject(r)) return r;
+
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("Failed to fetch market detail");
+}
+
+async function findMarketByTopicId(topicId) {
+  const root = await fetchMarketsRoot();
+
+  // find list item array by topicId+id
+  const marketsList = deepFindArrayByPredicate(root, looksLikeMarketListItem);
+  if (!Array.isArray(marketsList)) {
+    throw new Error(`Could not locate markets list array. rootKeys=${JSON.stringify(isPlainObject(root) ? Object.keys(root).slice(0, 60) : null)}`);
   }
 
-  const found = markets.find((m) => String(m.topicId ?? m.topic_id) === String(topicId));
-  return found || null;
+  const listItem = marketsList.find((m) => String(pickTopicId(m)) === String(topicId));
+  if (!listItem) return null;
+
+  // If list already has token ids, we’re done
+  const tokens = pickTokenIds(listItem);
+  if (tokens.yesTokenId && tokens.noTokenId) return listItem;
+
+  // Otherwise, fetch detail by id
+  const marketId = pickMarketId(listItem);
+  if (!marketId) return listItem;
+
+  const detail = await fetchMarketDetailById(marketId);
+  // merge list + detail
+  return { ...listItem, ...detail };
 }
 
 /* ---------------- endpoints ---------------- */
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, base: OPINION_API_BASE, hasKey: Boolean(OPINION_API_KEY) });
+  res.json({
+    ok: true,
+    base: OPINION_API_BASE,
+    hasKey: Boolean(OPINION_API_KEY),
+  });
 });
 
 app.get("/api/debug", async (req, res) => {
   try {
-    const result = await fetchMarketsResult();
-    const markets = deepFindMarketsArray(result);
+    const root = await fetchMarketsRoot();
 
-    const sample = Array.isArray(markets) ? markets[0] : null;
+    const marketsList = deepFindArrayByPredicate(root, looksLikeMarketListItem);
+    const sample = Array.isArray(marketsList) ? marketsList[0] : null;
+
     res.json({
       ok: true,
       base: OPINION_API_BASE,
-      resultType: Array.isArray(result) ? "array" : typeof result,
-      resultKeys: isPlainObject(result) ? Object.keys(result).slice(0, 60) : null,
-      marketsFound: Array.isArray(markets),
-      marketsCount: Array.isArray(markets) ? markets.length : null,
-      sampleKeys: sample && typeof sample === "object" ? Object.keys(sample).slice(0, 60) : null,
+      rootKeys: isPlainObject(root) ? Object.keys(root).slice(0, 60) : null,
+      marketsFound: Array.isArray(marketsList),
+      marketsCount: Array.isArray(marketsList) ? marketsList.length : null,
+      sampleKeys: sample && isPlainObject(sample) ? Object.keys(sample).slice(0, 60) : null,
       sample,
     });
   } catch (e) {
@@ -332,9 +369,14 @@ app.post("/api/analyze", async (req, res) => {
     const market = await findMarketByTopicId(topicId);
     if (!market) return res.status(404).json({ error: "Market not found for topicId." });
 
-    const yesTokenId = market.yesTokenId ?? market.yes_token_id;
-    const noTokenId = market.noTokenId ?? market.no_token_id;
-    if (!yesTokenId || !noTokenId) return res.status(500).json({ error: "Market data missing token IDs." });
+    const { yesTokenId, noTokenId } = pickTokenIds(market);
+    if (!yesTokenId || !noTokenId) {
+      return res.status(500).json({
+        error: "Could not resolve yes/no token IDs for this market.",
+        hint: "Market list may not include token IDs and market detail endpoint might differ.",
+        marketSampleKeys: isPlainObject(market) ? Object.keys(market).slice(0, 80) : null,
+      });
+    }
 
     const volume24h = Number(market.volume24h ?? market.volume_24h ?? market.volume ?? 0);
 
@@ -345,7 +387,7 @@ app.post("/api/analyze", async (req, res) => {
 
     const tokens = await Promise.all(
       tokenRequests.map(async ({ side, tokenId }) => {
-        const q = encodeURIComponent(tokenId);
+        const q = encodeURIComponent(String(tokenId));
 
         const [latestPrice, orderbook, history] = await Promise.all([
           openApiGet(`/token/latest-price?token_id=${q}`),
@@ -387,7 +429,7 @@ app.post("/api/analyze", async (req, res) => {
 
         return {
           side,
-          tokenLabel: side, // frontend compatibility
+          tokenLabel: side, // keep frontend compatibility
           tokenId,
           verdict,
           confidence,
