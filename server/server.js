@@ -30,7 +30,6 @@ function parseTopicId(input) {
 }
 
 function headers() {
-  // Opinion OpenAPI expects apikey header (as you already used successfully for /market)
   return {
     accept: "application/json",
     apikey: OPINION_API_KEY,
@@ -51,7 +50,6 @@ function isObj(x) {
  * Supports envelopes:
  * - { code, msg, result }
  * - { errno, errmsg, result }
- * Otherwise returns payload as-is.
  */
 async function openApiGet(pathnameAndQuery, { allowNoEnvelope = true } = {}) {
   const url = join(OPINION_API_BASE, pathnameAndQuery);
@@ -101,12 +99,24 @@ let _specCache = null;
 let _specFetchedAt = 0;
 
 async function getOpenApiSpec() {
-  // OPINION_API_BASE points to .../openapi. Fetch spec from that URL.
   const now = Date.now();
   if (_specCache && now - _specFetchedAt < 5 * 60 * 1000) return _specCache;
 
-  const url = OPINION_API_BASE; // already includes /openapi
-  const resp = await fetch(url, { headers: { accept: "application/json" } });
+  if (!OPINION_API_KEY) {
+    throw new Error("Missing OPINION_API_KEY (needed to fetch OpenAPI spec).");
+  }
+
+  // OPINION_API_BASE already points to .../openapi
+  const url = OPINION_API_BASE;
+
+  // IMPORTANT FIX: include apikey for spec too (401 otherwise)
+  const resp = await fetch(url, {
+    headers: {
+      accept: "application/json",
+      apikey: OPINION_API_KEY,
+    },
+  });
+
   const text = await resp.text();
 
   if (!resp.ok) {
@@ -123,7 +133,9 @@ async function getOpenApiSpec() {
   }
 
   if (!isObj(spec) || !isObj(spec.paths)) {
-    console.error(`OpenAPI spec missing paths. keys=${isObj(spec) ? Object.keys(spec) : null}`);
+    console.error(
+      `OpenAPI spec missing paths. keys=${isObj(spec) ? Object.keys(spec) : null}`
+    );
     throw new Error("OpenAPI spec missing paths");
   }
 
@@ -146,9 +158,7 @@ function scorePath(p, mustHave = [], niceToHave = []) {
   let score = 0;
   for (const w of mustHave) if (s.includes(w)) score += 10;
   for (const w of niceToHave) if (s.includes(w)) score += 2;
-  // Prefer token endpoints
   if (s.includes("token")) score += 3;
-  // Prefer explicit names
   if (s.includes("latest")) score += 1;
   return score;
 }
@@ -159,7 +169,7 @@ async function resolveTokenPaths() {
 
   const latestCandidates = getPaths
     .map((p) => ({ p, score: scorePath(p, ["price"], ["latest", "token"]) }))
-    .filter((x) => x.score >= 10); // must include "price" at least
+    .filter((x) => x.score >= 10);
 
   const orderbookCandidates = getPaths
     .map((p) => ({ p, score: scorePath(p, ["orderbook"], ["token"]) }))
@@ -169,22 +179,17 @@ async function resolveTokenPaths() {
     .map((p) => ({ p, score: scorePath(p, ["history"], ["price", "token"]) }))
     .filter((x) => x.score >= 10);
 
-  // pick best scored containing token + price etc.
   const pickBest = (arr) => arr.sort((a, b) => b.score - a.score)[0]?.p || null;
 
-  const latestPath = pickBest(latestCandidates);
-  const orderbookPath = pickBest(orderbookCandidates);
-  const historyPath = pickBest(historyCandidates);
-
   return {
-    latestPath,
-    orderbookPath,
-    historyPath,
-    // helpful for debugging if something missing
+    latestPath: pickBest(latestCandidates),
+    orderbookPath: pickBest(orderbookCandidates),
+    historyPath: pickBest(historyCandidates),
+    allGetPaths: getPaths,
     candidates: {
-      latest: latestCandidates.slice(0, 10).map((x) => x.p),
-      orderbook: orderbookCandidates.slice(0, 10).map((x) => x.p),
-      history: historyCandidates.slice(0, 10).map((x) => x.p),
+      latest: latestCandidates.slice(0, 20).map((x) => x.p),
+      orderbook: orderbookCandidates.slice(0, 20).map((x) => x.p),
+      history: historyCandidates.slice(0, 20).map((x) => x.p),
     },
   };
 }
@@ -208,7 +213,6 @@ function pickMarketId(m) {
 }
 
 async function getMarketListPage(page, limit) {
-  // This endpoint is proven by your /api/debug output: result has { total, list }
   const r = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=2`);
   if (!isObj(r) || !Array.isArray(r.list)) {
     const keys = isObj(r) ? Object.keys(r) : null;
@@ -240,7 +244,6 @@ async function findMarketByTopicId(topicId) {
   return null;
 }
 
-// Optional: fetch detail if token IDs missing (tries only a few common shapes)
 async function fetchMarketDetailById(marketId) {
   const id = encodeURIComponent(String(marketId));
   const candidates = [
@@ -369,6 +372,8 @@ app.get("/api/debug", async (req, res) => {
         orderbook: paths.orderbookPath,
         history: paths.historyPath,
       },
+      // show first 80 GET paths so you can see reality fast
+      firstGetPaths: paths.allGetPaths.slice(0, 80),
       tokenPathCandidates: paths.candidates,
     });
   } catch (e) {
@@ -380,21 +385,13 @@ app.post("/api/analyze", async (req, res) => {
   const { url } = req.body || {};
   const topicId = parseTopicId(url);
 
-  if (!topicId) {
-    return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
-  }
-  if (!OPINION_API_KEY) {
-    return res.status(500).json({ error: "Missing API key (OPINION_API_KEY)." });
-  }
+  if (!topicId) return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
+  if (!OPINION_API_KEY) return res.status(500).json({ error: "Missing API key (OPINION_API_KEY)." });
 
   try {
-    // 1) find market by topicId (known working endpoint)
     let market = await findMarketByTopicId(topicId);
-    if (!market) {
-      return res.status(404).json({ error: "Market not found for topicId." });
-    }
+    if (!market) return res.status(404).json({ error: "Market not found for topicId." });
 
-    // 2) resolve yes/no token ids (sometimes in rules, sometimes in detail)
     let { yesTokenId, noTokenId } = pickTokenIds(market);
 
     if (!yesTokenId || !noTokenId) {
@@ -413,7 +410,6 @@ app.post("/api/analyze", async (req, res) => {
       });
     }
 
-    // 3) discover token endpoints from OpenAPI spec (NO guessing)
     const paths = await resolveTokenPaths();
     if (!paths.latestPath || !paths.orderbookPath || !paths.historyPath) {
       return res.status(500).json({
@@ -438,7 +434,6 @@ app.post("/api/analyze", async (req, res) => {
       tokenRequests.map(async ({ side, tokenId }) => {
         const q = encodeURIComponent(String(tokenId));
 
-        // IMPORTANT: use resolved paths, just append query
         const latestUrl = `${paths.latestPath}?token_id=${q}`;
         const orderbookUrl = `${paths.orderbookPath}?token_id=${q}`;
         const historyUrl = `${paths.historyPath}?token_id=${q}&interval=1h`;
@@ -451,7 +446,6 @@ app.post("/api/analyze", async (req, res) => {
 
         const metrics = calcMetrics({ latestPrice, orderbook, history, volume24h });
 
-        // scoring
         const liquidityScore = scoreMetric(metrics.depth, { ok: 25000, wait: 10000 });
         const spreadScore = scoreInverseMetric(metrics.spreadPercent, { ok: 2.5, wait: 5 });
         const moveScore = scoreInverseMetric(metrics.movePercent, { ok: 6, wait: 12 });
@@ -464,26 +458,10 @@ app.post("/api/analyze", async (req, res) => {
         const confidence = Math.round(((totalScore + 4) / 8) * 100);
 
         const facts = [
-          {
-            label: "Liquidity (top 1% depth)",
-            value: `$${formatNumber(metrics.depth)}`,
-            status: liquidityScore.label,
-          },
-          {
-            label: "Spread",
-            value: `${metrics.spreadPercent.toFixed(2)}%`,
-            status: spreadScore.label,
-          },
-          {
-            label: "1h move",
-            value: `${metrics.movePercent.toFixed(2)}%`,
-            status: moveScore.label,
-          },
-          {
-            label: "24h volume",
-            value: `$${formatNumber(metrics.volume24h)}`,
-            status: volumeScore.label,
-          },
+          { label: "Liquidity (top 1% depth)", value: `$${formatNumber(metrics.depth)}`, status: liquidityScore.label },
+          { label: "Spread", value: `${metrics.spreadPercent.toFixed(2)}%`, status: spreadScore.label },
+          { label: "1h move", value: `${metrics.movePercent.toFixed(2)}%`, status: moveScore.label },
+          { label: "24h volume", value: `$${formatNumber(metrics.volume24h)}`, status: volumeScore.label },
         ];
 
         const why = [
@@ -500,16 +478,12 @@ app.post("/api/analyze", async (req, res) => {
 
         return {
           side,
-          tokenLabel: side, // keep frontend compatibility
+          tokenLabel: side,
           tokenId,
           verdict,
           confidence,
           totalScore,
-          metrics: {
-            spread: metrics.spreadPercent,
-            depth: metrics.depth,
-            move1h: metrics.movePercent,
-          },
+          metrics: { spread: metrics.spreadPercent, depth: metrics.depth, move1h: metrics.movePercent },
           facts,
           why: why.slice(0, 3),
         };
@@ -518,9 +492,7 @@ app.post("/api/analyze", async (req, res) => {
 
     const overallScore = tokens.reduce((s, t) => s + t.totalScore, 0) / tokens.length;
     const overallVerdict = getVerdict(overallScore);
-    const overallConfidence = Math.round(
-      tokens.reduce((s, t) => s + t.confidence, 0) / tokens.length
-    );
+    const overallConfidence = Math.round(tokens.reduce((s, t) => s + t.confidence, 0) / tokens.length);
 
     res.json({
       topicId,
