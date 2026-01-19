@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Opinion IQ</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>Opinion IQ</h1>
+        <p>Paste an Opinion topic URL to get an aggressive trade readiness check.</p>
+      </header>
+
+      <section class="card input-card">
+        <label for="topic-url">Opinion topic URL</label>
+        <div class="input-row">
+          <input
+            id="topic-url"
+            type="text"
+            placeholder="https://app.opinion.trade/detail?topicId=61&type=multi"
+          />
+          <button id="analyze-btn">Analyze</button>
+        </div>
+        <p class="hint">We only read the topicId query parameter from the URL.</p>
+      </section>
+
+      <section class="card results" hidden>
+        <div class="verdict-row">
+          <div>
+            <p class="label">Verdict</p>
+            <h2 id="verdict">--</h2>
+          </div>
+          <div>
+            <p class="label">Confidence</p>
+            <h3 id="confidence">--</h3>
+          </div>
+        </div>
+
+        <div class="facts">
+          <h3>Facts</h3>
+          <ul id="facts-list"></ul>
+        </div>
+
+        <div class="why">
+          <h3>Why</h3>
+          <ul id="why-list"></ul>
+        </div>
+
+        <div class="actions">
+          <button id="copy-btn">Copy Summary</button>
+          <span id="copy-status" role="status"></span>
+        </div>
+      </section>
+
+      <section class="card error" hidden>
+        <p id="error-message"></p>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
