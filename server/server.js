@@ -59,17 +59,28 @@ async function fetchJson(url) {
 // ---- Opinion helpers ----
 
 // Fetch list and find market by topicId (topicId from app.opinion.trade URL is NOT marketId in OpenAPI)
-async function getMarketIdByTopicId(topicId) {
+async function getMarketIdByTopicId(topicId)  {
   const listUrl = `${OPINION_API_BASE}/market`;
   const list = await fetchJson(listUrl);
 
-  // Some APIs return { data: [...] }
-  const markets = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : [];
+  const markets =
+    list?.data ||
+    list?.markets ||
+    list?.items ||
+    (Array.isArray(list) ? list : []);
 
-  const found = markets.find((m) => String(m?.topicId) === String(topicId));
-  if (!found?.id) {
-    throw new Error(`Market not found for topicId ${topicId} (check topicId or API base)`);
+  if (!Array.isArray(markets)) {
+    throw new Error("Unexpected /market response format");
   }
+
+  const found = markets.find(
+    (m) => String(m.topicId) === String(topicId)
+  );
+
+  if (!found?.id) {
+    throw new Error(`Market not found for topicId ${topicId}`);
+  }
+
   return found.id;
 }
 
