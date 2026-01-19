@@ -1,78 +1,83 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const BASE = "https://openapi.opinion.trade/openapi";
+const PORT = process.env.PORT || 8080;
 
-/* ================= utils ================= */
-
-const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+const API_BASE = "https://openapi.opinion.trade/openapi";
 
 async function openApiGet(path) {
-  const res = await fetch(`${BASE}${path}`, {
+  const r = await fetch(API_BASE + path, {
     headers: {
-      "accept": "application/json",
-      "user-agent": "opinioniq/1.0",
+      "content-type": "application/json",
     },
   });
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  return res.json();
+  if (!r.ok) throw new Error(`OpenAPI ${r.status}`);
+  return r.json();
 }
 
-/* ================= core ================= */
+// 🔥 ЄДИНА ФУНКЦІЯ ПОШУКУ МАРКЕТУ (БЕЗ DETAIL)
+async function findMarketById(targetId) {
+  const target = String(targetId);
+  const LIMIT = 20;
+  const MAX_PAGES = 60;
 
-async function fetchMarketDetail(marketId) {
-  const id = encodeURIComponent(String(marketId));
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const r = await openApiGet(`/market?page=${page}&limit=${LIMIT}&marketType=2`);
+    const list = r?.result?.list || r?.list || [];
+    if (!Array.isArray(list)) continue;
 
-  const endpoints = [
-    `/market/${id}`,
-    `/market/detail?marketId=${id}`,
-    `/market/detail?id=${id}`,
-    `/market/info?marketId=${id}`,
-  ];
+    for (const parent of list) {
+      // 1️⃣ прямий маркет
+      if (String(parent.marketId) === target) return parent;
 
-  for (const ep of endpoints) {
-    try {
-      const r = await openApiGet(ep);
-      if (isObj(r?.data)) return r.data;
-      if (isObj(r?.result)) return r.result;
-      if (isObj(r)) return r;
-    } catch (_) {}
+      // 2️⃣ дочірній маркет
+      if (Array.isArray(parent.childMarkets)) {
+        for (const child of parent.childMarkets) {
+          if (String(child.marketId) === target) return child;
+        }
+      }
+    }
   }
 
-  throw new Error("Market not found");
+  return null;
 }
 
-/* ================= routes ================= */
+// ================= ROUTES =================
 
 app.get("/", (_, res) => {
-  res.json({ ok: true, status: "online" });
+  res.send("OpinionIQ API is running");
 });
 
 app.get("/api/debug", async (req, res) => {
   try {
     const { marketId } = req.query;
-    if (!marketId) return res.status(400).json({ ok: false, error: "marketId required" });
+    if (!marketId) {
+      return res.status(400).json({ ok: false, error: "marketId required" });
+    }
 
-    const market = await fetchMarketDetail(marketId);
+    const market = await findMarketById(marketId);
+
+    if (!market) {
+      return res.status(404).json({ ok: false, error: "Market not found" });
+    }
 
     res.json({
       ok: true,
-      marketId,
+      marketId: market.marketId,
+      marketTitle: market.marketTitle,
       yesTokenId: market.yesTokenId || null,
       noTokenId: market.noTokenId || null,
-      keys: Object.keys(market),
+      hasTokens: Boolean(market.yesTokenId || market.noTokenId),
+      raw: market,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-/* ================= start ================= */
+// ==========================================
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on ${PORT}`);
+app.listen(PORT, () => {
+  console.log(`OpinionIQ running on port ${PORT}`);
 });
