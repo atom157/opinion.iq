@@ -1,13 +1,20 @@
 const path = require("path");
-
 const express = require("express");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const OPINION_API_BASE = process.env.OPINION_API_BASE;
 const OPINION_API_KEY = process.env.OPINION_API_KEY;
+
+// Normalize base: allow either "https://openapi.opinion.trade" or ".../openapi"
+function normalizeApiBase(raw) {
+  if (!raw) return null;
+  const base = String(raw).trim().replace(/\/+$/, "");
+  return base.endsWith("/openapi") ? base : `${base}/openapi`;
+}
+
+const OPINION_API_BASE = normalizeApiBase(process.env.OPINION_API_BASE);
 
 if (!OPINION_API_BASE || !OPINION_API_KEY) {
   console.warn(
@@ -19,9 +26,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 function parseTopicId(input) {
-  if (!input) {
-    return null;
-  }
+  if (!input) return null;
 
   try {
     const url = new URL(input);
@@ -51,10 +56,40 @@ async function fetchJson(url) {
   return response.json();
 }
 
-function sumDepthWithinPercent(orderbook, mid, percent) {
-  if (!orderbook || !mid) {
-    return 0;
+// ---- Opinion helpers ----
+
+// Fetch list and find market by topicId (topicId from app.opinion.trade URL is NOT marketId in OpenAPI)
+async function getMarketIdByTopicId(topicId) {
+  const listUrl = `${OPINION_API_BASE}/market`;
+  const list = await fetchJson(listUrl);
+
+  // Some APIs return { data: [...] }
+  const markets = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : [];
+
+  const found = markets.find((m) => String(m?.topicId) === String(topicId));
+  if (!found?.id) {
+    throw new Error(`Market not found for topicId ${topicId} (check topicId or API base)`);
   }
+  return found.id;
+}
+
+// Optional: pull market detail (binary or categorical)
+async function getMarketDetail(marketId) {
+  try {
+    return await fetchJson(`${OPINION_API_BASE}/market/${marketId}`);
+  } catch (e) {
+    // Fallback categorical (some markets might be categorical)
+    try {
+      return await fetchJson(`${OPINION_API_BASE}/market/categorical/${marketId}`);
+    } catch {
+      throw e;
+    }
+  }
+}
+
+function sumDepthWithinPercent(orderbook, mid, percent) {
+  if (!orderbook || !mid) return 0;
+
   const threshold = mid * (percent / 100);
   const maxBid = mid + threshold;
   const minAsk = mid - threshold;
@@ -64,6 +99,7 @@ function sumDepthWithinPercent(orderbook, mid, percent) {
         .filter((bid) => bid.price >= minAsk)
         .reduce((total, bid) => total + Number(bid.size || 0), 0)
     : 0;
+
   const askDepth = Array.isArray(orderbook.asks)
     ? orderbook.asks
         .filter((ask) => ask.price <= maxBid)
@@ -74,39 +110,25 @@ function sumDepthWithinPercent(orderbook, mid, percent) {
 }
 
 function scoreMetric(value, thresholds) {
-  if (value >= thresholds.ok) {
-    return { label: "OK", score: 1 };
-  }
-  if (value >= thresholds.wait) {
-    return { label: "WAIT", score: 0 };
-  }
+  if (value >= thresholds.ok) return { label: "OK", score: 1 };
+  if (value >= thresholds.wait) return { label: "WAIT", score: 0 };
   return { label: "NO TRADE", score: -1 };
 }
 
 function scoreInverseMetric(value, thresholds) {
-  if (value <= thresholds.ok) {
-    return { label: "OK", score: 1 };
-  }
-  if (value <= thresholds.wait) {
-    return { label: "WAIT", score: 0 };
-  }
+  if (value <= thresholds.ok) return { label: "OK", score: 1 };
+  if (value <= thresholds.wait) return { label: "WAIT", score: 0 };
   return { label: "NO TRADE", score: -1 };
 }
 
 function getVerdict(total) {
-  if (total >= 1) {
-    return "OK";
-  }
-  if (total === 0) {
-    return "WAIT";
-  }
+  if (total >= 1) return "OK";
+  if (total === 0) return "WAIT";
   return "NO TRADE";
 }
 
 function formatNumber(value) {
-  return Number(value || 0).toLocaleString(undefined, {
-    maximumFractionDigits: 2,
-  });
+  return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
 app.post("/api/analyze", async (req, res) => {
@@ -122,13 +144,19 @@ app.post("/api/analyze", async (req, res) => {
   }
 
   try {
-    const marketUrl = `${OPINION_API_BASE}/market/${topicId}`;
-    const priceUrl = `${OPINION_API_BASE}/market/${topicId}/price`;
-    const orderbookUrl = `${OPINION_API_BASE}/market/${topicId}/orderbook`;
-    const historyUrl = `${OPINION_API_BASE}/market/${topicId}/history?interval=1h&limit=48`;
+    // 1) topicId -> marketId
+    const marketId = await getMarketIdByTopicId(topicId);
+
+    // 2) use marketId for endpoints
+    const priceUrl = `${OPINION_API_BASE}/market/${marketId}/price`;
+    const orderbookUrl = `${OPINION_API_BASE}/market/${marketId}/orderbook`;
+    const historyUrl = `${OPINION_API_BASE}/market/${marketId}/history?interval=1h&limit=48`;
+
+    // Market detail (binary/categorical)
+    const marketPromise = getMarketDetail(marketId);
 
     const [market, latestPrice, orderbook, history] = await Promise.all([
-      fetchJson(marketUrl),
+      marketPromise,
       fetchJson(priceUrl),
       fetchJson(orderbookUrl),
       fetchJson(historyUrl),
@@ -137,9 +165,7 @@ app.post("/api/analyze", async (req, res) => {
     const bestBid = Number(orderbook?.bids?.[0]?.price || 0);
     const bestAsk = Number(orderbook?.asks?.[0]?.price || 0);
     const mid = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : Number(latestPrice?.price || 0);
-    const spreadPercent = mid
-      ? ((bestAsk - bestBid) / mid) * 100
-      : 0;
+    const spreadPercent = mid ? ((bestAsk - bestBid) / mid) * 100 : 0;
 
     const depth = sumDepthWithinPercent(orderbook, mid, 1);
 
@@ -148,9 +174,7 @@ app.post("/api/analyze", async (req, res) => {
     if (Array.isArray(historyPoints) && historyPoints.length > 1) {
       const latest = Number(historyPoints[historyPoints.length - 1]?.price || 0);
       const prior = Number(historyPoints[historyPoints.length - 2]?.price || 0);
-      if (prior) {
-        movePercent = Math.abs(((latest - prior) / prior) * 100);
-      }
+      if (prior) movePercent = Math.abs(((latest - prior) / prior) * 100);
     }
 
     const volume24h = Number(market?.volume24h || market?.volume_24h || 0);
@@ -167,26 +191,10 @@ app.post("/api/analyze", async (req, res) => {
     const confidence = Math.round(((totalScore + 4) / 8) * 100);
 
     const facts = [
-      {
-        label: "Liquidity (top 1% depth)",
-        value: `$${formatNumber(depth)}`,
-        status: liquidityScore.label,
-      },
-      {
-        label: "Spread",
-        value: `${spreadPercent.toFixed(2)}%`,
-        status: spreadScore.label,
-      },
-      {
-        label: "1h move",
-        value: `${movePercent.toFixed(2)}%`,
-        status: moveScore.label,
-      },
-      {
-        label: "24h volume",
-        value: `$${formatNumber(volume24h)}`,
-        status: volumeScore.label,
-      },
+      { label: "Liquidity (top 1% depth)", value: `$${formatNumber(depth)}`, status: liquidityScore.label },
+      { label: "Spread", value: `${spreadPercent.toFixed(2)}%`, status: spreadScore.label },
+      { label: "1h move", value: `${movePercent.toFixed(2)}%`, status: moveScore.label },
+      { label: "24h volume", value: `$${formatNumber(volume24h)}`, status: volumeScore.label },
     ];
 
     const why = [
@@ -203,6 +211,7 @@ app.post("/api/analyze", async (req, res) => {
 
     res.json({
       topicId,
+      marketId,
       market,
       latestPrice,
       orderbook,
