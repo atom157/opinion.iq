@@ -10,9 +10,7 @@ const OPINION_API_BASE = (process.env.OPINION_API_BASE || "").trim();
 const OPINION_API_KEY = (process.env.OPINION_API_KEY || "").trim();
 
 if (!OPINION_API_BASE || !OPINION_API_KEY) {
-  console.warn(
-    "Missing OPINION_API_BASE or OPINION_API_KEY. Set Railway Variables (or .env locally)."
-  );
+  console.warn("Missing OPINION_API_BASE or OPINION_API_KEY.");
 }
 
 app.use(express.json({ limit: "1mb" }));
@@ -22,7 +20,6 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 
 function parseTopicId(input) {
   if (!input) return null;
-
   try {
     const url = new URL(input);
     return url.searchParams.get("topicId");
@@ -49,7 +46,6 @@ async function fetchJsonStrict(url) {
   const { res, text } = await fetchText(url);
 
   if (!res.ok) {
-    // віддаємо текст помилки, щоб в логах Railway було видно реальний endpoint/причину
     throw new Error(`Request failed (${res.status}): ${text}`);
   }
 
@@ -65,10 +61,6 @@ function uniq(arr) {
 }
 
 function normalizeBases(base) {
-  // Підтримує:
-  // - https://openapi.opinion.trade
-  // - https://openapi.opinion.trade/openapi
-  // І пробує з /openapi та без нього
   const b = base.replace(/\/+$/, "");
   const noOpenapi = b.replace(/\/openapi$/i, "");
   return uniq([b, noOpenapi, `${noOpenapi}/openapi`]);
@@ -79,71 +71,102 @@ async function fetchFirstWorking(urls) {
 
   for (const url of urls) {
     try {
-      return { data: await fetchJsonStrict(url), usedUrl: url };
+      const data = await fetchJsonStrict(url);
+      return { data, usedUrl: url };
     } catch (e) {
       lastErr = e;
 
-      // Якщо 404 — пробуємо наступний кандидат
-      if (String(e.message).includes("(404)")) continue;
+      // 404 / no route → пробуємо далі
+      const msg = String(e.message || "");
+      if (msg.includes("(404)") || msg.includes("no Route matched")) continue;
 
-      // Якщо інша помилка (401/403/500) — краще одразу показати її, бо це вже не "не той endpoint"
+      // інші помилки (401/403/429/500) — показуємо одразу
       throw e;
     }
   }
 
-  // Усі кандидати дали 404
   throw lastErr || new Error("All endpoint candidates failed");
 }
 
-function buildCandidates(bases, topicId) {
-  // Ми не знаємо точний контракт API, тому робимо “умний перебір”.
-  // Найчастіші варіанти:
-  // /market/:id  або /markets/:id
-  // price/orderbook/history можуть бути під ними
-  const marketPaths = [
-    `/market/${topicId}`,
-    `/markets/${topicId}`,
+function buildCandidates(bases, id) {
+  // Найчастіші префікси
+  const prefixes = ["", "/v1", "/api/v1", "/openapi", "/openapi/v1"];
+
+  // Варіанти кореневих ресурсів
+  const marketRoots = [
+    `/market/${id}`,
+    `/markets/${id}`,
+    `/topic/${id}`,
+    `/topics/${id}`,
   ];
 
-  const priceSuffixes = [
-    `/price`,
-    `/prices/latest`,
-    `/ticker`,
-  ];
+  // Для випадку topicId != marketId: треба витягнути список і знайти відповідність
+  const listRoots = ["/market", "/markets"];
 
-  const orderbookSuffixes = [
-    `/orderbook`,
-    `/order-book`,
-    `/book`,
-  ];
-
+  // Сафікси
+  const priceSuffixes = ["/price", "/prices/latest", "/ticker"];
+  const orderbookSuffixes = ["/orderbook", "/order-book", "/book"];
   const historySuffixes = [
-    `/history?interval=1h&limit=48`,
-    `/candles?interval=1h&limit=48`,
-    `/kline?interval=1h&limit=48`,
+    "/history?interval=1h&limit=48",
+    "/candles?interval=1h&limit=48",
+    "/kline?interval=1h&limit=48",
   ];
 
   const marketUrls = [];
+  const listUrls = [];
   const priceUrls = [];
   const orderbookUrls = [];
   const historyUrls = [];
 
   for (const base of bases) {
-    for (const p of marketPaths) {
-      const root = `${base}${p}`;
-      marketUrls.push(root);
-      for (const s of priceSuffixes) priceUrls.push(`${root}${s}`);
-      for (const s of orderbookSuffixes) orderbookUrls.push(`${root}${s}`);
-      for (const s of historySuffixes) historyUrls.push(`${root}${s}`);
+    for (const pref of prefixes) {
+      for (const p of marketRoots) {
+        const root = `${base}${pref}${p}`;
+        marketUrls.push(root);
+        for (const s of priceSuffixes) priceUrls.push(`${root}${s}`);
+        for (const s of orderbookSuffixes) orderbookUrls.push(`${root}${s}`);
+        for (const s of historySuffixes) historyUrls.push(`${root}${s}`);
+      }
+      for (const lp of listRoots) {
+        listUrls.push(`${base}${pref}${lp}`);
+      }
     }
   }
 
   return {
     marketUrls: uniq(marketUrls),
+    listUrls: uniq(listUrls),
     priceUrls: uniq(priceUrls),
     orderbookUrls: uniq(orderbookUrls),
     historyUrls: uniq(historyUrls),
   };
+}
+
+function extractArray(resp) {
+  if (!resp) return [];
+  if (Array.isArray(resp)) return resp;
+  if (Array.isArray(resp.data)) return resp.data;
+  if (Array.isArray(resp.markets)) return resp.markets;
+  if (Array.isArray(resp.items)) return resp.items;
+  if (Array.isArray(resp.result)) return resp.result;
+  return [];
+}
+
+async function resolveMarketIdFromTopicId(topicId, listUrls) {
+  // Пробуємо дістати список markets і знайти market.id по topicId
+  const listRes = await fetchFirstWorking(listUrls);
+  const arr = extractArray(listRes.data);
+
+  if (!arr.length) {
+    throw new Error("Market list endpoint returned no array (unexpected format).");
+  }
+
+  const found = arr.find((m) => String(m?.topicId) === String(topicId));
+  if (!found?.id) {
+    throw new Error(`Market not found in list for topicId ${topicId}`);
+  }
+
+  return { marketId: found.id, usedUrl: listRes.usedUrl };
 }
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
@@ -194,6 +217,7 @@ function pickHistoryArray(history) {
   if (Array.isArray(history.data)) return history.data;
   if (Array.isArray(history.history)) return history.history;
   if (Array.isArray(history.items)) return history.items;
+  if (Array.isArray(history.result)) return history.result;
   return [];
 }
 
@@ -201,23 +225,55 @@ app.post("/api/analyze", async (req, res) => {
   const { url } = req.body;
   const topicId = parseTopicId(url);
 
-  if (!topicId) {
-    return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
-  }
-
-  if (!OPINION_API_BASE || !OPINION_API_KEY) {
+  if (!topicId) return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
+  if (!OPINION_API_BASE || !OPINION_API_KEY)
     return res.status(500).json({ error: "Missing API configuration." });
-  }
+
+  const bases = normalizeBases(OPINION_API_BASE);
 
   try {
-    const bases = normalizeBases(OPINION_API_BASE);
-    const { marketUrls, priceUrls, orderbookUrls, historyUrls } = buildCandidates(bases, topicId);
+    // 1) Спершу пробуємо “напряму” по topicId
+    let candidates = buildCandidates(bases, topicId);
 
-    // ВАЖЛИВО: робимо послідовно, щоб не шмаляти 20 запитів паралельно
-    const marketRes = await fetchFirstWorking(marketUrls);
-    const priceRes = await fetchFirstWorking(priceUrls);
-    const orderbookRes = await fetchFirstWorking(orderbookUrls);
-    const historyRes = await fetchFirstWorking(historyUrls);
+    let marketRes, priceRes, orderbookRes, historyRes;
+    let debug = { basesTried: bases, used: {} };
+
+    try {
+      marketRes = await fetchFirstWorking(candidates.marketUrls);
+      priceRes = await fetchFirstWorking(candidates.priceUrls);
+      orderbookRes = await fetchFirstWorking(candidates.orderbookUrls);
+      historyRes = await fetchFirstWorking(candidates.historyUrls);
+
+      debug.used.market = marketRes.usedUrl;
+      debug.used.price = priceRes.usedUrl;
+      debug.used.orderbook = orderbookRes.usedUrl;
+      debug.used.history = historyRes.usedUrl;
+    } catch (e) {
+      // 2) Якщо 404/no route — значить topicId не marketId або інший ресурс.
+      // Спробуємо резолв через список markets: topicId -> marketId
+      const msg = String(e.message || "");
+      if (!(msg.includes("(404)") || msg.includes("no Route matched"))) {
+        throw e;
+      }
+
+      const resolved = await resolveMarketIdFromTopicId(topicId, candidates.listUrls);
+      const marketId = resolved.marketId;
+
+      // rebuild candidates for real marketId
+      candidates = buildCandidates(bases, marketId);
+
+      marketRes = await fetchFirstWorking(candidates.marketUrls);
+      priceRes = await fetchFirstWorking(candidates.priceUrls);
+      orderbookRes = await fetchFirstWorking(candidates.orderbookUrls);
+      historyRes = await fetchFirstWorking(candidates.historyUrls);
+
+      debug.used.market = marketRes.usedUrl;
+      debug.used.price = priceRes.usedUrl;
+      debug.used.orderbook = orderbookRes.usedUrl;
+      debug.used.history = historyRes.usedUrl;
+      debug.used.marketList = resolved.usedUrl;
+      debug.resolved = { topicId, marketId };
+    }
 
     const market = marketRes.data;
     const latestPrice = priceRes.data;
@@ -270,39 +326,27 @@ app.post("/api/analyze", async (req, res) => {
         : "Recent 1h move is within the aggressive tolerance.",
     ];
 
-    res.json({
+    return res.json({
       topicId,
       verdict,
       confidence,
       facts,
       why: why.slice(0, 3),
-
-      // щоб ти бачив, що реально спрацювало (ДУЖЕ корисно для дебага)
-      debug: {
-        used: {
-          market: marketRes.usedUrl,
-          price: priceRes.usedUrl,
-          orderbook: orderbookRes.usedUrl,
-          history: historyRes.usedUrl,
-        },
-        basesTried: bases,
-      },
-
-      // сирі дані — лишив як було
-      market,
-      latestPrice,
-      orderbook,
-      history,
       scores: {
         liquidity: liquidityScore,
         spread: spreadScore,
         move1h: moveScore,
         volume24h: volumeScore,
       },
+      debug,
+      market,
+      latestPrice,
+      orderbook,
+      history,
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: error.message || "Failed to analyze" });
+    return res.status(500).json({ error: error.message || "Failed to analyze" });
   }
 });
 
