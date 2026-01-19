@@ -4,29 +4,34 @@ const express = require("express");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT || 8080);
 
 /**
- * IMPORTANT:
- * - OPINION_API_BASE should be the API host/root (NO /openapi at the end)
- * - OPINION_OPENAPI_URL should point to the OpenAPI doc endpoint (often .../openapi)
+ * Railway variables you have:
+ * OPINION_API_BASE can be:
+ *  - https://proxy.opinion.trade:8443
+ *  - https://proxy.opinion.trade:8443/openapi
+ *
+ * We ALWAYS call OpenAPI endpoints under: {base}/openapi/v1/...
  */
-function normalizeApiBase(raw) {
-  if (!raw) return "";
-  // If user accidentally put /openapi as base, strip it.
-  return String(raw).replace(/\/openapi\/?$/i, "");
+function buildOpenApiBase(raw) {
+  const base = String(raw || "").trim();
+  if (!base) return "";
+  // If already ends with /openapi -> keep, else append
+  return /\/openapi\/?$/i.test(base) ? base.replace(/\/+$/, "") : base.replace(/\/+$/, "") + "/openapi";
 }
 
-const OPINION_API_BASE = normalizeApiBase(process.env.OPINION_API_BASE || "https://proxy.opinion.trade:8443");
-const OPINION_OPENAPI_URL =
-  process.env.OPINION_OPENAPI_URL ||
-  // If they provided OPINION_API_BASE but not OPENAPI_URL, assume /openapi
-  `${OPINION_API_BASE}/openapi`;
+const RAW_OPINION_API_BASE =
+  process.env.OPINION_API_BASE || "https://proxy.opinion.trade:8443/openapi";
 
+const OPINION_OPENAPI_BASE = buildOpenApiBase(RAW_OPINION_API_BASE);
 const OPINION_API_KEY = process.env.OPINION_API_KEY;
 
 if (!OPINION_API_KEY) {
   console.warn("Missing OPINION_API_KEY. Set it in Railway Variables.");
+}
+if (!OPINION_OPENAPI_BASE) {
+  console.warn("Missing OPINION_API_BASE. Set it in Railway Variables.");
 }
 
 app.use(express.json({ limit: "1mb" }));
@@ -35,8 +40,8 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 function parseTopicId(input) {
   if (!input) return null;
   try {
-    const url = new URL(input);
-    return url.searchParams.get("topicId");
+    const u = new URL(input);
+    return u.searchParams.get("topicId");
   } catch {
     const match = String(input).match(/topicId=(\d+)/);
     return match ? match[1] : null;
@@ -50,16 +55,27 @@ function getHeaders() {
   };
 }
 
+function joinUrl(base, pathnameAndQuery) {
+  const b = base.replace(/\/+$/, "");
+  const p = String(pathnameAndQuery || "").startsWith("/")
+    ? pathnameAndQuery
+    : `/${pathnameAndQuery}`;
+  return `${b}${p}`;
+}
+
 /**
  * Opinion OpenAPI envelope:
  * { code, msg, result }
+ * If code !== 0 => error(msg)
  */
-async function fetchOpenApiJson(fullUrl) {
-  const resp = await fetch(fullUrl, { headers: getHeaders() });
+async function fetchOpenApi(pathnameAndQuery) {
+  const url = joinUrl(OPINION_OPENAPI_BASE, pathnameAndQuery);
+
+  const resp = await fetch(url, { headers: getHeaders() });
   const text = await resp.text();
 
   if (!resp.ok) {
-    console.error(`HTTP error for ${fullUrl}: ${text}`);
+    console.error(`HTTP error for ${url}: ${text}`);
     throw new Error(`Request failed (${resp.status}): ${text}`);
   }
 
@@ -67,44 +83,66 @@ async function fetchOpenApiJson(fullUrl) {
   try {
     payload = JSON.parse(text);
   } catch {
-    console.error(`Non-JSON response for ${fullUrl}: ${text}`);
-    throw new Error(`Non-JSON response from API: ${text.slice(0, 200)}`);
+    console.error(`Non-JSON response for ${url}: ${text}`);
+    throw new Error(`Non-JSON response from API: ${text.slice(0, 300)}`);
   }
 
-  // Some endpoints may not use envelope; support both
-  if (payload && typeof payload === "object" && "code" in payload && "result" in payload) {
+  // Strict envelope handling (as you requested)
+  if (payload && typeof payload === "object" && "code" in payload && "msg" in payload && "result" in payload) {
     if (payload.code !== 0) {
-      console.error(`OpenAPI envelope error for ${fullUrl}: ${JSON.stringify(payload)}`);
+      console.error(`OpenAPI envelope error for ${url}: ${JSON.stringify(payload)}`);
       throw new Error(payload.msg || "OpenAPI error");
     }
     return payload.result;
   }
 
+  // If some endpoint ever returns raw JSON (rare) - still allow, but log once
+  console.warn(`Warning: response without OpenAPI envelope for ${url}`);
   return payload;
 }
 
-async function fetchApi(pathnameAndQuery) {
-  const url = `${OPINION_API_BASE}${pathnameAndQuery}`;
-  return fetchOpenApiJson(url);
+function pickMarketsArray(result) {
+  if (Array.isArray(result)) return result;
+
+  // Some APIs wrap lists, so be defensive:
+  if (result && typeof result === "object") {
+    if (Array.isArray(result.list)) return result.list;
+    if (Array.isArray(result.items)) return result.items;
+    if (Array.isArray(result.markets)) return result.markets;
+    if (Array.isArray(result.data)) return result.data;
+  }
+
+  const hintKeys = result && typeof result === "object" ? Object.keys(result).slice(0, 30) : null;
+  const preview = (() => {
+    try {
+      return JSON.stringify(result).slice(0, 600);
+    } catch {
+      return String(result).slice(0, 600);
+    }
+  })();
+
+  throw new Error(
+    `Markets endpoint returned unexpected format (expected array). keys=${hintKeys} preview=${preview}`
+  );
 }
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
   if (!orderbook || !mid) return 0;
+
   const threshold = mid * (percent / 100);
   const maxPrice = mid + threshold;
   const minPrice = mid - threshold;
 
-  const bidDepth = Array.isArray(orderbook.bids)
-    ? orderbook.bids
-        .filter((b) => Number(b.price || 0) >= minPrice)
-        .reduce((t, b) => t + Number(b.size || 0), 0)
-    : 0;
+  const bids = Array.isArray(orderbook.bids) ? orderbook.bids : [];
+  const asks = Array.isArray(orderbook.asks) ? orderbook.asks : [];
 
-  const askDepth = Array.isArray(orderbook.asks)
-    ? orderbook.asks
-        .filter((a) => Number(a.price || 0) <= maxPrice)
-        .reduce((t, a) => t + Number(a.size || 0), 0)
-    : 0;
+  const bidDepth = bids
+    .filter((b) => Number(b.price || 0) >= minPrice)
+    .reduce((t, b) => t + Number(b.size || 0), 0);
+
+  const askDepth = asks
+    .filter((a) => Number(a.price || 0) <= maxPrice)
+    .reduce((t, a) => t + Number(a.size || 0), 0);
 
   return bidDepth + askDepth;
 }
@@ -141,8 +179,14 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   const spreadPercent = mid ? ((bestAsk - bestBid) / mid) * 100 : 0;
   const depth = sumDepthWithinPercent(orderbook, mid, 1);
 
-  // history could be array, or { data: [...] }
-  const pts = Array.isArray(history) ? history : Array.isArray(history?.data) ? history.data : [];
+  const pts = Array.isArray(history)
+    ? history
+    : Array.isArray(history?.data)
+      ? history.data
+      : Array.isArray(history?.list)
+        ? history.list
+        : [];
+
   let movePercent = 0;
   if (pts.length > 1) {
     const latest = Number(pts[pts.length - 1]?.price || 0);
@@ -156,24 +200,24 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
 app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
-    apiBase: OPINION_API_BASE,
-    openapiUrl: OPINION_OPENAPI_URL,
+    rawBase: RAW_OPINION_API_BASE,
+    openapiBase: OPINION_OPENAPI_BASE,
     hasKey: Boolean(OPINION_API_KEY),
   });
 });
 
-/**
- * Debug helper: checks if /v1/markets is reachable and returns first keys.
- * Use this to confirm the base is correct.
- */
 app.get("/api/debug", async (req, res) => {
   try {
-    const markets = await fetchApi("/v1/markets");
-    const sample = Array.isArray(markets) ? markets[0] : markets;
+    const result = await fetchOpenApi("/v1/markets");
+    const markets = pickMarketsArray(result);
+    const sample = markets[0] || null;
+
     res.json({
       ok: true,
+      openapiBase: OPINION_OPENAPI_BASE,
       marketsType: Array.isArray(markets) ? "array" : typeof markets,
-      sampleKeys: sample && typeof sample === "object" ? Object.keys(sample).slice(0, 30) : null,
+      marketsCount: markets.length,
+      sampleKeys: sample && typeof sample === "object" ? Object.keys(sample).slice(0, 40) : null,
       sample,
     });
   } catch (e) {
@@ -182,21 +226,17 @@ app.get("/api/debug", async (req, res) => {
 });
 
 app.post("/api/analyze", async (req, res) => {
-  const { url } = req.body;
+  const { url } = req.body || {};
   const topicId = parseTopicId(url);
 
   if (!topicId) return res.status(400).json({ error: "Invalid URL. Could not find topicId." });
   if (!OPINION_API_KEY) return res.status(500).json({ error: "Missing API key." });
+  if (!OPINION_OPENAPI_BASE) return res.status(500).json({ error: "Missing OPINION_API_BASE." });
 
   try {
     // 1) markets list
-    const markets = await fetchApi("/v1/markets");
-    if (!Array.isArray(markets)) {
-      return res.status(500).json({
-        error: "Markets endpoint returned unexpected format (expected array).",
-        hint: "Check OPINION_API_BASE. It must NOT end with /openapi.",
-      });
-    }
+    const marketsResult = await fetchOpenApi("/v1/markets");
+    const markets = pickMarketsArray(marketsResult);
 
     // 2) find market by topicId
     const market = markets.find((m) => String(m.topicId) === String(topicId));
@@ -205,6 +245,7 @@ app.post("/api/analyze", async (req, res) => {
     // 3) token ids
     const yesTokenId = market.yesTokenId ?? market.yes_token_id;
     const noTokenId = market.noTokenId ?? market.no_token_id;
+
     if (!yesTokenId || !noTokenId) {
       return res.status(500).json({ error: "Market data missing yes/no token IDs." });
     }
@@ -218,15 +259,16 @@ app.post("/api/analyze", async (req, res) => {
 
     const tokens = await Promise.all(
       tokenRequests.map(async ({ side, tokenId }) => {
+        const tokenQ = encodeURIComponent(tokenId);
+
         const [latestPrice, orderbook, history] = await Promise.all([
-          fetchApi(`/v1/token/latest-price?token_id=${encodeURIComponent(tokenId)}`),
-          fetchApi(`/v1/token/orderbook?token_id=${encodeURIComponent(tokenId)}`),
-          fetchApi(`/v1/token/price-history?token_id=${encodeURIComponent(tokenId)}&interval=1h`),
+          fetchOpenApi(`/v1/token/latest-price?token_id=${tokenQ}`),
+          fetchOpenApi(`/v1/token/orderbook?token_id=${tokenQ}`),
+          fetchOpenApi(`/v1/token/price-history?token_id=${tokenQ}&interval=1h`),
         ]);
 
         const metrics = calcMetrics({ latestPrice, orderbook, history, volume24h });
 
-        // scoring
         const liquidityScore = scoreMetric(metrics.depth, { ok: 25000, wait: 10000 });
         const spreadScore = scoreInverseMetric(metrics.spreadPercent, { ok: 2.5, wait: 5 });
         const moveScore = scoreInverseMetric(metrics.movePercent, { ok: 6, wait: 12 });
@@ -264,7 +306,11 @@ app.post("/api/analyze", async (req, res) => {
           verdict,
           confidence,
           totalScore,
-          metrics: { spread: metrics.spreadPercent, depth: metrics.depth, move1h: metrics.movePercent },
+          metrics: {
+            spread: metrics.spreadPercent,
+            depth: metrics.depth,
+            move1h: metrics.movePercent,
+          },
           facts,
           why: why.slice(0, 3),
         };
@@ -289,4 +335,5 @@ app.post("/api/analyze", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Opinion IQ running on http://localhost:${PORT}`);
+  console.log(`OpenAPI base: ${OPINION_OPENAPI_BASE}`);
 });
