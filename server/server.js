@@ -15,6 +15,8 @@ const OPINION_API_KEY = String(process.env.OPINION_API_KEY || "").trim();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
+/* ---------------- core helpers ---------------- */
+
 function parseTopicId(input) {
   if (!input) return null;
   try {
@@ -32,7 +34,7 @@ function headers() {
 }
 
 function join(base, p) {
-  const b = base.replace(/\/+$/, "");
+  const b = String(base || "").replace(/\/+$/, "");
   const pp = String(p || "").startsWith("/") ? p : `/${p}`;
   return `${b}${pp}`;
 }
@@ -78,19 +80,40 @@ async function openApiGet(pathnameAndQuery) {
   return payload;
 }
 
+/* ---------------- market field pickers ---------------- */
+
 function pickTopicId(m) {
-  return m?.topicId ?? m?.topic_id ?? m?.topicID ?? null;
+  return m?.topicId ?? m?.topic_id ?? m?.topicID ?? m?.topicid ?? null;
 }
 
 function pickMarketId(m) {
-  return m?.id ?? m?.marketId ?? m?.market_id ?? m?.mid ?? null;
+  return m?.id ?? m?.marketId ?? m?.market_id ?? m?.mid ?? m?.marketID ?? null;
 }
 
 function pickTokenIds(m) {
-  const yesTokenId = m?.yesTokenId ?? m?.yes_token_id ?? null;
-  const noTokenId = m?.noTokenId ?? m?.no_token_id ?? null;
+  // cover a lot of naming variants
+  const yesTokenId =
+    m?.yesTokenId ??
+    m?.yes_token_id ??
+    m?.yesToken ??
+    m?.yes_token ??
+    m?.yesTokenID ??
+    m?.yes_tokenID ??
+    null;
+
+  const noTokenId =
+    m?.noTokenId ??
+    m?.no_token_id ??
+    m?.noToken ??
+    m?.no_token ??
+    m?.noTokenID ??
+    m?.no_tokenID ??
+    null;
+
   return { yesTokenId, noTokenId };
 }
+
+/* ---------------- scoring ---------------- */
 
 function sumDepthWithinPercent(orderbook, mid, percent) {
   if (!orderbook || !mid) return 0;
@@ -138,7 +161,15 @@ function formatNumber(value) {
 function extractHistoryPoints(history) {
   if (Array.isArray(history)) return history;
   if (isObj(history)) {
-    const cands = [history.data, history.list, history.items, history.records, history.rows, history.history, history.prices];
+    const cands = [
+      history.data,
+      history.list,
+      history.items,
+      history.records,
+      history.rows,
+      history.history,
+      history.prices,
+    ];
     for (const c of cands) if (Array.isArray(c)) return c;
   }
   return [];
@@ -165,8 +196,9 @@ function calcMetrics({ latestPrice, orderbook, history, volume24h }) {
   return { bestBid, bestAsk, mid, spreadPercent, depth, movePercent, volume24h };
 }
 
+/* ---------------- market discovery ---------------- */
+
 async function getMarketListPage(page, limit) {
-  // We already know result has { total, list }
   const r = await openApiGet(`/market?page=${page}&limit=${limit}&marketType=2`);
   if (!isObj(r) || !Array.isArray(r.list)) {
     const keys = isObj(r) ? Object.keys(r) : null;
@@ -177,9 +209,8 @@ async function getMarketListPage(page, limit) {
 
 async function findMarketByTopicId(topicId) {
   const limit = 20;
-  let page = 1;
 
-  const first = await getMarketListPage(page, limit);
+  const first = await getMarketListPage(1, limit);
   const total = Number(first.total || 0);
   const pages = total ? Math.ceil(total / limit) : 50;
 
@@ -190,11 +221,12 @@ async function findMarketByTopicId(topicId) {
   if (found) return found;
 
   const maxPages = Math.min(pages, 80);
-  for (page = 2; page <= maxPages; page++) {
+  for (let page = 2; page <= maxPages; page++) {
     const r = await getMarketListPage(page, limit);
     found = findIn(r.list);
     if (found) return found;
   }
+
   return null;
 }
 
@@ -230,8 +262,7 @@ app.get("/api/debug", async (req, res) => {
       ok: true,
       base: OPINION_API_BASE,
       total: r.total ?? null,
-      listType: Array.isArray(r.list) ? "array" : typeof r.list,
-      sampleKeys: r.list?.[0] ? Object.keys(r.list[0]).slice(0, 60) : null,
+      sampleKeys: r.list?.[0] ? Object.keys(r.list[0]).slice(0, 80) : null,
       sample: r.list?.[0] ?? null,
     });
   } catch (e) {
@@ -252,6 +283,7 @@ app.post("/api/analyze", async (req, res) => {
 
     let { yesTokenId, noTokenId } = pickTokenIds(market);
 
+    // If token ids are missing, fetch detail and merge
     if (!yesTokenId || !noTokenId) {
       const marketId = pickMarketId(market);
       if (marketId) {
@@ -264,7 +296,8 @@ app.post("/api/analyze", async (req, res) => {
     if (!yesTokenId || !noTokenId) {
       return res.status(500).json({
         error: "Could not resolve yes/no token IDs for this market.",
-        marketKeys: isObj(market) ? Object.keys(market).slice(0, 120) : null,
+        marketKeys: isObj(market) ? Object.keys(market).slice(0, 160) : null,
+        market,
       });
     }
 
